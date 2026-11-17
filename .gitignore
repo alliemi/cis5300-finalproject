@@ -1,0 +1,11 @@
+# Generated data: regenerate with generate_data.py, or extract data.tar.gz.
+# (train.jsonl alone is 360 MB, over GitHub's 100 MB file limit.)
+data/
+data_sample.tar.gz
+
+# Training outputs: checkpoints, logs, predictions
+runs/
+
+__pycache__/
+*.pyc
+.DS_Store
