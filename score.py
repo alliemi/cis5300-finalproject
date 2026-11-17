@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Score prData status predictions using exact match and retrieval diagnostics."""
+"""Score status predictions using exact match and retrieval diagnostics."""
 
 import argparse
 from collections import Counter, defaultdict
