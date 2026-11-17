@@ -1,0 +1,4 @@
+{"id":"example-1","task":"recall","answer":"shipped","stale_values":[],"distractor_values":["testing"],"context_length":128,"num_entities":2,"num_updates":0,"needle_position_bin":0}
+{"id":"example-2","task":"update","answer":"merged","stale_values":["onion"],"distractor_values":["velvet"],"context_length":256,"num_entities":4,"num_updates":1,"needle_position_bin":1}
+{"id":"example-3","task":"recall","answer":"snowy","stale_values":[],"distractor_values":["red"],"context_length":256,"num_entities":8,"num_updates":0,"needle_position_bin":2}
+{"id":"example-4","task":"update","answer":"glossy","stale_values":["signed","pending"],"distractor_values":["spiky"],"context_length":512,"num_entities":8,"num_updates":2,"needle_position_bin":4}
