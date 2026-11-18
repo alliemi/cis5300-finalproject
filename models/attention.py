@@ -14,6 +14,7 @@ in the flash-linear-attention (fla) Triton kernels on CUDA.
 
 from __future__ import annotations
 
+import functools
 import math
 import warnings
 from typing import Optional
@@ -26,6 +27,16 @@ import torch.nn.functional as F
 def _up(t):
     """Upcast to at least float32 (keeps float64 for tests)."""
     return t.to(torch.promote_types(t.dtype, torch.float32))
+
+
+def _full_precision(fn):
+    """Run a recurrence with autocast off. Upcasting with _up() is not enough on
+    its own: under bf16 autocast, `@` and einsum still compute in bf16."""
+    @functools.wraps(fn)
+    def wrapper(q, *args, **kwargs):
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            return fn(q, *args, **kwargs)
+    return wrapper
 
 
 class RMSNorm(nn.Module):
@@ -71,6 +82,7 @@ class SoftmaxAttention(nn.Module):
 
 # ---------------------------------------------------------------- linear
 
+@_full_precision
 def linear_attention_recurrent(q, k, v, eps: float = 1e-6):
     """Reference: S_t = S_{t-1} + k_t v_t^T, z_t = z_{t-1} + k_t,
     o_t = q_t^T S_t / (q_t . z_t). Inputs (B, H, T, D) with q, k already feature-mapped."""
@@ -89,6 +101,7 @@ def linear_attention_recurrent(q, k, v, eps: float = 1e-6):
     return torch.stack(out, dim=2).to(dtype)
 
 
+@_full_precision
 def linear_attention_chunked(q, k, v, chunk: int = 64, eps: float = 1e-6):
     """Same result as `linear_attention_recurrent`, computed in parallel.
 
@@ -139,6 +152,7 @@ class LinearAttention(nn.Module):
 
 # ---------------------------------------------------------------- delta rule
 
+@_full_precision
 def delta_rule_recurrent(q, k, v, g, beta, scale: Optional[float] = None):
     """Reference gated delta rule, step by step, in float32.
 

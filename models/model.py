@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .attention import RMSNorm, build_attention
+from .attention import RMSNorm, ShortConv, build_attention
 
 
 @dataclass
@@ -27,6 +27,7 @@ class ModelConfig:
     conv_size: int = 4             # gated_deltanet / kda
     expand_v: float = 1.0          # gated_deltanet / kda: value dim = expand_v * head dim
     kernel: str = "auto"           # gated_deltanet / kda: auto | torch | fla
+    short_conv: int = 0            # all: shared causal conv before every mixer (0 = off)
 
     def to_dict(self):
         return asdict(self)
@@ -45,15 +46,23 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
+    """Pre-norm block. With short_conv > 0, a causal depthwise conv (residual)
+    runs before the mixer, giving every architecture the same local window for
+    linking a project name to the value right after it."""
+
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.norm1 = RMSNorm(cfg.d_model, cfg.norm_eps)
+        self.conv = ShortConv(cfg.d_model, cfg.short_conv) if cfg.short_conv > 0 else None
         self.attn = build_attention(cfg)
         self.norm2 = RMSNorm(cfg.d_model, cfg.norm_eps)
         self.mlp = SwiGLU(cfg.d_model, cfg.mlp_ratio)
 
     def forward(self, x):
-        x = x + self.attn(self.norm1(x))
+        h = self.norm1(x)
+        if self.conv is not None:
+            h = h + self.conv(h)
+        x = x + self.attn(h)
         return x + self.mlp(self.norm2(x))
 
 
