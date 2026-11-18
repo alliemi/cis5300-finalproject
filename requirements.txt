@@ -1,0 +1,7 @@
+# Data generation and scoring use only the Python standard library.
+# Model code:
+torch>=2.3
+numpy
+# GPU only: Triton kernels for gated_deltanet and kda (falls back to a slow
+# PyTorch reference without it). Install on the CUDA machine:
+#   pip install flash-linear-attention
