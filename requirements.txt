@@ -1,0 +1,4 @@
+# Model training only. The data generator, validator and score.py need no packages.
+# Colab already has these installed.
+torch>=2.4
+numpy

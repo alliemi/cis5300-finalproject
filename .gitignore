@@ -8,3 +8,6 @@ runs/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Local Python environment (uv venv)
+.venv/

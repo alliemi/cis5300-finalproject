@@ -1,0 +1,5 @@
+{
+  "base": "base.json",
+  "mixer": "linear",
+  "mixer_cfg": {"chunk_size": 64}
+}
