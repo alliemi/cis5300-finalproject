@@ -18,7 +18,7 @@ CIS 5300 term project. We train small models from scratch with different attenti
 | 4. Score | `python3 score.py --gold data/dev.jsonl --predictions PRED.jsonl` | accuracy + error breakdowns (3a already does this for dev) |
 | 5. Compare | `python3 summarize_runs.py` | one table across runs, `runs/summary.csv` |
 
-Instead of steps 1–2 you can run `tar -xzf data.tar.gz`, which gives byte-identical files. `make_archive.py data` rebuilds `data.tar.gz`.
+Generation is deterministic (seed 5300), so every run gives byte-identical files; step 1 takes under a minute. The data is not checked in. `make_archive.py data` can package it as a reproducible `data.tar.gz` if you need to share it.
 
 ## Layout
 

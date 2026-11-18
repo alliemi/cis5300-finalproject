@@ -35,8 +35,8 @@ training examples), `--multi-query 16`, `--curriculum-steps 12000`, 20k steps,
 ## How to run
 
 Requirements: `pip install -r requirements.txt` (PyTorch), and the data
-(`tar -xzf data.tar.gz`, plus `python generate_data.py --n-train 400000 --out data_big`
-for the larger training set). Training needs a GPU. On a Colab A100 we measured
+(`python3 generate_data.py --out data` for dev/test, plus
+`python3 generate_data.py --n-train 400000 --out data_big` for the larger training set). Training needs a GPU. On a Colab A100 we measured
 about 670k tokens/s, so 20,000 steps × 65,536 tokens (1.31B tokens) take about
 33 minutes, plus the periodic dev evaluations.
 

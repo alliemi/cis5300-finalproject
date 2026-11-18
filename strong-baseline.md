@@ -53,8 +53,8 @@ about 670k tokens/s, so 20,000 steps × 65,536 tokens (1.31B tokens) take about
 
 ```sh
 # Data
-tar -xzf data.tar.gz
-python generate_data.py --n-train 400000 --out data_big
+python3 generate_data.py --out data
+python3 generate_data.py --n-train 400000 --out data_big
 
 # 1. Train (also writes runs/softmax-cur12k/dev_pred.jsonl and dev_scores.json)
 python train.py --attention softmax --out runs/softmax-cur12k --data-dir data_big \
