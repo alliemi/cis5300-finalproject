@@ -95,6 +95,26 @@ Why these flags:
 * **`--multi-query K`.** With one supervised answer per sequence, softmax learned slowly and stopped improving around 37% even on 128-token contexts. With this flag, each training sequence also asks about up to K other projects in the same context: `... <sep> answer (<sep> query_e <sep> value_e)* <eos>`. The answers come from the fact parser in `synthdata/errors.py`, and a fresh random subset is drawn for every batch. Evaluation still decodes only after the official query, so dev and test results stay comparable. In the logs, `ans_acc` is training accuracy on the official answer only, which is comparable with dev accuracy. `tok_acc` includes the extra answers.
 * **Long curriculum (`--curriculum-steps 12000`).** Retrieval is learned in a sudden jump: on 128-token contexts alone, softmax sat at about 45% until step 1,700, then reached 99% dev accuracy by step 2,000. With 12000 curriculum steps, each bucket gets 3,000 steps alone before the next one unlocks, so the jump can happen on short contexts first. With `--curriculum-steps 4000` (1,000 steps per bucket), softmax only reached 29% dev accuracy, and 66% of answers were another project's value. No `--patience`: dev accuracy can stay flat for thousands of steps before the jump.
 
+### Results
+
+Training commands (`{RUNS}` is the output directory for runs):
+
+```sh
+python train.py --attention linear --out {RUNS}/linear-cur12k --data-dir data_big \
+    --multi-query 16 --curriculum-steps 12000 --steps 20000 --max-tokens 65536
+python train.py --attention softmax --out {RUNS}/softmax-cur12k --data-dir data_big \
+    --multi-query 16 --curriculum-steps 12000 --steps 20000 --max-tokens 65536
+```
+
+Dev scores (10,000 examples: 4,968 recall, 5,032 update):
+
+| Model | Accuracy | Recall acc. | Update acc. | Stale errors | Distractor errors | Other errors |
+|---|---|---|---|---|---|---|
+| `softmax-cur12k` | 1.0000 (10000/10000) | 1.0000 (4968/4968) | 1.0000 (5032/5032) | 0 (0.0000) | 0 (0.0000) | 0 (0.0000) |
+| `linear-cur12k` | 0.1753 (1753/10000) | 0.1989 (988/4968) | 0.1520 (765/5032) | 382 (0.0382) | 7735 (0.7735) | 130 (0.0130) |
+
+Softmax attention solves the task perfectly. Linear attention gets 17.5%, and 77% of its answers are another project's value (distractor errors), so it fails to bind the queried project to its value.
+
 ## Requirements and tests
 
 The data and scoring code use only the Python 3.9+ standard library. The model code needs `requirements.txt`, and the model tests are skipped when PyTorch is missing.
