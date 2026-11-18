@@ -28,7 +28,7 @@ if HAVE_TORCH:
     import predict
     import summarize_runs
     import train
-    from models.attention import ATTENTION, delta_rule_recurrent, linear_attention_chunked
+    from models.attention import ATTENTION, linear_attention_chunked
     from models.model import LanguageModel, ModelConfig
     from score import evaluate as score_evaluate
     from synthdata.generator import generate_dataset
@@ -126,7 +126,7 @@ class TrainingRunTest(unittest.TestCase):
 class ShortConvTest(unittest.TestCase):
     def cfg(self, attention, **kw):
         return ModelConfig(vocab_size=50, attention=attention, d_model=32, n_layers=2, n_heads=2,
-                           kernel="torch", linear_chunk=8, **kw)
+                           linear_chunk=8, **kw)
 
     def test_off_by_default(self):
         m = LanguageModel(self.cfg("linear"))
@@ -151,20 +151,13 @@ class ShortConvTest(unittest.TestCase):
 class FullPrecisionTest(unittest.TestCase):
     """Under bf16 autocast, the reference recurrences must still compute in float32."""
 
-    def test_linear_and_delta_rule_ignore_autocast(self):
+    def test_linear_ignores_autocast(self):
         torch.manual_seed(0)
         q, k = (F.elu(torch.randn(2, 2, 300, 16)) + 1 for _ in range(2))
         v = torch.randn(2, 2, 300, 16)
         ref = linear_attention_chunked(q, k, v)
         with torch.autocast("cpu", dtype=torch.bfloat16):
             got = linear_attention_chunked(q, k, v)
-        torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-6)
-
-        qd, kd = (F.normalize(torch.randn(2, 100, 2, 16), dim=-1) for _ in range(2))
-        vd, beta, g = torch.randn(2, 100, 2, 16), torch.rand(2, 100, 2), -torch.rand(2, 100, 2) * 0.1
-        ref = delta_rule_recurrent(qd, kd, vd, g, beta)
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            got = delta_rule_recurrent(qd, kd, vd, g, beta)
         torch.testing.assert_close(got, ref, rtol=1e-6, atol=1e-6)
 
 

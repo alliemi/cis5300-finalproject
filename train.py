@@ -8,7 +8,7 @@ CPU smoke test (a few minutes):
         --steps 300 --max-tokens 4096 --eval-every 100
 
 GPU run (see README for the full recipe):
-    python train.py --attention gated_deltanet --out runs/gdn
+    python train.py --attention linear --out runs/linear
 
 Rerunning the same command resumes from <out>/last.pt (e.g. after a Colab
 disconnect). When training ends, best.pt predicts the full dev split and
@@ -46,9 +46,6 @@ def parse_args(argv=None):
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--mlp-ratio", type=float, default=4.0)
-    p.add_argument("--expand-v", type=float, default=1.0, help="GDN/KDA value expansion")
-    p.add_argument("--kernel", default="auto", choices=["auto", "torch", "fla"],
-                   help="GDN/KDA recurrence: fla Triton kernels (CUDA) or PyTorch reference")
     p.add_argument("--short-conv", type=int, default=0,
                    help="shared causal conv window before every mixer, for all attention types (0 = off)")
     # data
@@ -199,7 +196,7 @@ def main(argv=None):
 
     cfg = ModelConfig(vocab_size=len(vocab), attention=args.attention, d_model=args.d_model,
                       n_layers=args.n_layers, n_heads=args.n_heads, mlp_ratio=args.mlp_ratio,
-                      expand_v=args.expand_v, kernel=args.kernel, short_conv=args.short_conv)
+                      short_conv=args.short_conv)
     model = LanguageModel(cfg).to(device)
     print(f"model: {args.attention}, {model.num_params():,} params "
           f"({model.num_mixer_params():,} in attention layers), device {device}")

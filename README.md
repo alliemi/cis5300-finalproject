@@ -36,7 +36,7 @@ score.py              official scorer (exact match + stale/distractor/other)
 examples/             tiny gold/prediction fixture for score.py
 models/               model code (needs PyTorch)
   data.py             vocab, encoding, tokenization cache, length-bucketed batching
-  attention.py        softmax | linear | gated_deltanet | kda token mixers
+  attention.py        softmax | linear token mixers
   model.py            shared backbone (embedding, pre-norm blocks, SwiGLU MLP, tied head)
   inference.py        greedy decoding, checkpoints, quick dev accuracy
 train.py              CLI: train one model (resumes automatically, scores dev at the end)
@@ -58,12 +58,10 @@ The backbone is the same for every run: token embedding, `n_layers` pre-norm blo
 |---|---|---|
 | `softmax` | causal softmax attention with RoPE | `F.scaled_dot_product_attention` |
 | `linear` | linear attention, φ = elu+1, with normalizer (Katharopoulos et al., 2020) | chunked parallel form, pure PyTorch |
-| `gated_deltanet` | short conv + L2-normalized q/k, delta rule, one decay per head, SiLU output gate (Yang et al., 2025) | fla `chunk_gated_delta_rule` on CUDA, PyTorch reference otherwise |
-| `kda` | as GDN, but one decay per key channel (low-rank) and a sigmoid low-rank output gate (Kimi Team, 2025) | fla `chunk_kda` on CUDA, PyTorch reference otherwise |
 
-GDN and KDA have more parameters in the mixer (convolutions and gates). `train.py` prints both counts, and the tests check that everything outside the mixer is identical.
+`train.py` prints the total and mixer parameter counts, and the tests check that everything outside the mixer is identical.
 
-**Optional shared short convolution (`--short-conv 4`, off by default).** GDN and KDA include a short convolution inside the mixer, and softmax has RoPE, but linear attention has neither, so it has no easy way to link a project name to the value right after it. `--short-conv N` adds the same causal convolution (window N) before the mixer in every block, for every attention type. If the team uses it, use it for all models.
+**Optional shared short convolution (`--short-conv 4`, off by default).** Softmax has RoPE, but linear attention has no position information, so it has no easy way to link a project name to the value right after it. `--short-conv N` adds the same causal convolution (window N) before the mixer in every block, for every attention type. If the team uses it, use it for all models.
 
 ### CPU smoke test
 
@@ -77,15 +75,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 python3 score.py --gold runs/smoke/dev_gold.jsonl --predictions runs/smoke/dev_pred.jsonl
 ```
 
-On an Apple-silicon Mac, `--device auto` uses the GPU (MPS); CUDA is used when available. The first run tokenizes every split once and caches it in `data/cache/`. `--write-gold` is needed when predicting on a subset, because `score.py` requires a prediction for every gold id. On CPU, `gated_deltanet` and `kda` use the step-by-step PyTorch reference, which is slow. Keep CPU runs at 128–256 tokens.
+On an Apple-silicon Mac, `--device auto` uses the GPU (MPS); CUDA is used when available. The first run tokenizes every split once and caches it in `data/cache/`. `--write-gold` is needed when predicting on a subset, because `score.py` requires a prediction for every gold id. Keep CPU runs at 128–256 tokens.
 
 ### GPU runs
 
 ```sh
-pip install -r requirements.txt flash-linear-attention
-python -m unittest tests.test_models -v      # includes the fla vs. reference checks
+pip install -r requirements.txt
+python -m unittest tests.test_models -v
 python generate_data.py --n-train 400000 --out data_big   # more training data; dev/test unchanged
-for ATT in softmax linear gated_deltanet kda; do
+for ATT in softmax linear; do
   python train.py --attention $ATT --out runs/$ATT-s0 --seed 0 --data-dir data_big \
       --multi-query 16 --curriculum-steps 12000 --steps 20000 --max-tokens 65536
 done
@@ -94,7 +92,7 @@ python3 summarize_runs.py
 
 Each run ends by predicting the full dev split with `best.pt` and writing `dev_pred.jsonl` and `dev_scores.json` (from `score.py`) into its folder; `--no-final-eval` skips this. With `--max-context-length`, only that part of dev is scored, and the matching gold file is written as `dev_gold.jsonl`.
 
-**On Colab**, open `notebooks/colab_train.ipynb` (A100 or L4 runtime). It clones the repo, unpacks the data, installs flash-linear-attention, keeps `runs/` in Google Drive, and uses one `FLAGS` setting for every model.
+**On Colab**, open `notebooks/colab_train.ipynb` (A100 or L4 runtime). It clones the repo, unpacks the data, keeps `runs/` in Google Drive, and uses one `FLAGS` setting for every model.
 
 **Resuming.** `last.pt` stores the optimizer, the batch sampler and the RNG states, and is written atomically at every evaluation. Rerunning the same command in the same `--out` continues from that step and gives the same result as an uninterrupted run. A run folder refuses different training settings (e.g. a changed `--steps`), so start a new `--out` instead. Settings that don't affect training (`--device`, `--log-every`, `--compile`) may change.
 

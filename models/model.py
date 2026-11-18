@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import torch
 import torch.nn as nn
@@ -24,13 +24,16 @@ class ModelConfig:
     tie_embeddings: bool = True
     rope_base: float = 10000.0     # softmax only
     linear_chunk: int = 64         # linear only
-    conv_size: int = 4             # gated_deltanet / kda
-    expand_v: float = 1.0          # gated_deltanet / kda: value dim = expand_v * head dim
-    kernel: str = "auto"           # gated_deltanet / kda: auto | torch | fla
     short_conv: int = 0            # all: shared causal conv before every mixer (0 = off)
 
     def to_dict(self):
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d):
+        """Ignore unknown keys, e.g. settings of layers removed since the checkpoint was saved."""
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
 
 
 class SwiGLU(nn.Module):

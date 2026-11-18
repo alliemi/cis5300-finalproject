@@ -1,8 +1,6 @@
 """Checks for the attention layers, backbone, data pipeline and decoding.
 
-Runs on CPU. Tests that compare against the fla Triton kernels run only when
-CUDA and flash-linear-attention are available (run them once on the GPU box).
-Skipped entirely when PyTorch is not installed.
+Runs on CPU. Skipped entirely when PyTorch is not installed.
 """
 
 import json
@@ -21,8 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 if HAVE_TORCH:
     import torch.nn.functional as F
-    from models.attention import (ATTENTION, build_attention, delta_rule_recurrent, _fla_kernel,
-                                  linear_attention_chunked, linear_attention_recurrent)
+    from models.attention import (ATTENTION, build_attention, linear_attention_chunked,
+                                  linear_attention_recurrent)
     from models.data import (EXTRA_QUERY_LEN, IGNORE_INDEX, BucketBatchSampler, Vocab, collate,
                              encode_record, eval_batches, load_split)
     from models.inference import greedy_decode, load_checkpoint, save_checkpoint
@@ -30,29 +28,9 @@ if HAVE_TORCH:
 
     def tiny_cfg(attention, **kw):
         base = dict(vocab_size=50, attention=attention, d_model=32, n_layers=2, n_heads=2,
-                    kernel="torch", linear_chunk=8)
+                    linear_chunk=8)
         base.update(kw)
         return ModelConfig(**base)
-
-HAVE_FLA_GPU = HAVE_TORCH and torch.cuda.is_available() and _fla_kernel(False) is not None
-
-
-def recurrent_ref_loop(q, k, v, g, beta, scale):
-    """Independent, unbatched float64 gated delta rule, one (example, head) at a time:
-    S <- Diag(a) S;  S <- S - b k (k^T S) + b k v^T;  o = S^T (scale q)."""
-    B, T, H, K = q.shape
-    out = torch.zeros(B, T, H, v.shape[-1], dtype=torch.float64)
-    for b in range(B):
-        for h in range(H):
-            S = torch.zeros(K, v.shape[-1], dtype=torch.float64)
-            for t in range(T):
-                a = g[b, t, h].double().exp()
-                S = (a[:, None] if a.dim() else a) * S
-                kt = k[b, t, h].double()
-                S = S - beta[b, t, h].double() * torch.outer(kt, kt @ S) \
-                      + beta[b, t, h].double() * torch.outer(kt, v[b, t, h].double())
-                out[b, t, h] = S.T @ (q[b, t, h].double() * scale)
-    return out
 
 
 @unittest.skipUnless(HAVE_TORCH, "PyTorch not installed")
@@ -98,71 +76,6 @@ class AttentionLayerTest(unittest.TestCase):
                 got = linear_attention_chunked(q, k, v, chunk=chunk).double()
                 torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-6)
 
-    def test_delta_rule_matches_unbatched_loop(self):
-        B, T, H, K, V = 2, 7, 2, 4, 3
-        q, k = (F.normalize(torch.randn(B, T, H, K, dtype=torch.float64), dim=-1) for _ in range(2))
-        v = torch.randn(B, T, H, V, dtype=torch.float64)
-        beta = torch.rand(B, T, H, dtype=torch.float64)
-        for g in (-torch.rand(B, T, H, dtype=torch.float64),          # GDN: scalar per head
-                  -torch.rand(B, T, H, K, dtype=torch.float64)):      # KDA: per channel
-            with self.subTest(g_dim=g.dim()):
-                got = delta_rule_recurrent(q, k, v, g, beta, scale=0.5).double()
-                torch.testing.assert_close(got, recurrent_ref_loop(q, k, v, g, beta, 0.5))
-
-    def test_delta_rule_overwrites_value_under_same_key(self):
-        """The property that should help on Update examples: with beta = 1 and
-        no decay, writing key k twice replaces the first value, while plain
-        linear attention returns a mix of both."""
-        K = 4
-        k = F.normalize(torch.randn(K, dtype=torch.float64), dim=0)
-        keys = k.expand(1, 2, 1, K).clone()
-        vals = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float64).view(1, 2, 1, 2)
-        o = delta_rule_recurrent(keys, keys, vals, torch.zeros(1, 2, 1, dtype=torch.float64),
-                                 torch.ones(1, 2, 1, dtype=torch.float64), scale=1.0)
-        torch.testing.assert_close(o[0, -1, 0], torch.tensor([0.0, 1.0], dtype=torch.float64))
-        lin = linear_attention_recurrent(keys.transpose(1, 2) + 1, keys.transpose(1, 2) + 1,
-                                         vals.transpose(1, 2))
-        torch.testing.assert_close(lin[0, 0, -1], torch.tensor([0.5, 0.5], dtype=torch.float64))
-
-    def test_decay_forgets(self):
-        """A strongly negative log-decay should erase earlier memory."""
-        K = 4
-        k = F.normalize(torch.randn(1, 2, 1, K, dtype=torch.float64), dim=-1)
-        v = torch.randn(1, 2, 1, 3, dtype=torch.float64)
-        g = torch.tensor([0.0, -50.0], dtype=torch.float64).view(1, 2, 1)
-        beta = torch.tensor([1.0, 0.0], dtype=torch.float64).view(1, 2, 1)
-        o = delta_rule_recurrent(k, k, v, g, beta, 1.0)
-        self.assertLess(o[0, 1].abs().max().item(), 1e-12)
-
-    @unittest.skipUnless(HAVE_FLA_GPU, "needs CUDA + flash-linear-attention")
-    def test_fla_kernels_match_reference(self):
-        from models.attention import delta_rule_fla
-        torch.manual_seed(0)
-        B, T, H, K = 2, 300, 4, 64
-        dev = "cuda"
-        q, k = (F.normalize(torch.randn(B, T, H, K, device=dev), dim=-1) for _ in range(2))
-        v = torch.randn(B, T, H, K, device=dev)
-        beta = torch.rand(B, T, H, device=dev)
-        for per_channel in (False, True):
-            with self.subTest(per_channel=per_channel):
-                shape = (B, T, H, K) if per_channel else (B, T, H)
-                g = F.logsigmoid(torch.randn(*shape, device=dev) + 3)
-                ref = delta_rule_recurrent(q, k, v, g, beta, K ** -0.5)
-                got = delta_rule_fla(q, k, v, g, beta, K ** -0.5, per_channel).float()
-                torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-3)
-
-    @unittest.skipUnless(HAVE_FLA_GPU, "needs CUDA + flash-linear-attention")
-    def test_fla_layer_matches_torch_layer(self):
-        for name in ("gated_deltanet", "kda"):
-            with self.subTest(name):
-                torch.manual_seed(0)
-                layer = build_attention(tiny_cfg(name, d_model=128, n_heads=2)).cuda()
-                x = torch.randn(2, 200, 128, device="cuda")
-                layer.kernel = "torch"
-                ref = layer(x)
-                layer.kernel = "fla"
-                torch.testing.assert_close(layer(x), ref, rtol=2e-2, atol=2e-3)
-
 
 @unittest.skipUnless(HAVE_TORCH, "PyTorch not installed")
 class BackboneTest(unittest.TestCase):
@@ -182,9 +95,14 @@ class BackboneTest(unittest.TestCase):
                 padded = torch.cat([ids, torch.zeros(1, 6, dtype=torch.long)], dim=1)
                 torch.testing.assert_close(m(ids), m(padded)[:, :13])
 
+    def test_config_ignores_removed_settings(self):
+        """Checkpoints saved before gated_deltanet/kda were removed still load."""
+        old = dict(tiny_cfg("softmax").to_dict(), conv_size=4, expand_v=1.0, kernel="auto")
+        self.assertEqual(ModelConfig.from_dict(old), tiny_cfg("softmax"))
+
     def test_checkpoint_roundtrip(self):
         vocab = Vocab(["<pad>", "<bos>", "<sep>", "<eos>"] + [f"w{i}" for i in range(46)])
-        m = LanguageModel(tiny_cfg("kda"))
+        m = LanguageModel(tiny_cfg("linear"))
         with tempfile.TemporaryDirectory() as d:
             save_checkpoint(Path(d) / "c.pt", m, vocab, step=3)
             m2, v2, ck = load_checkpoint(Path(d) / "c.pt", torch.device("cpu"))
