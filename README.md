@@ -4,6 +4,8 @@ CIS 5300 term project. We train small models from scratch with different attenti
 
 * `data.md`: the dataset (format, example, how it was made)
 * `scoring.md`: the evaluation metric and error categories
+* `simple-baseline.md`: simple baseline, linear attention (`simple-baseline.py`)
+* `strong-baseline.md`: strong baseline, softmax Transformer
 
 ## Pipeline
 

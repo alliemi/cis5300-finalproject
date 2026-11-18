@@ -160,8 +160,8 @@ only, not query or separator tokens.
 
 Use the development split for model selection and debugging. Reserve the test
 split for final evaluation, as specified in `data.md`. Use the same prediction
-format and scoring policy for all architectures. No trained baseline scores are
-included here because this deliverable implements only evaluation.
+format and scoring policy for all architectures. Baseline scores are reported in
+`simple-baseline.md` (linear attention) and `strong-baseline.md` (softmax attention).
 
 ## Verification
 
