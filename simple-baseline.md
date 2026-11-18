@@ -6,9 +6,7 @@ Our simple baseline is a small language model whose token mixer is **linear
 attention** (Katharopoulos et al., 2020), trained from scratch on our Recall /
 Update data. Linear attention replaces the softmax with a feature map
 φ(x) = elu(x) + 1, so the model can be run as an RNN with a fixed-size state.
-This makes it the simplest efficient-attention model, and the starting point
-for the gated and delta-rule variants (Gated DeltaNet, KDA) that the project
-studies. The question is how much retrieval ability this fixed-size state loses.
+This makes it the simplest efficient-attention model. The question is how much retrieval ability this fixed-size state loses.
 
 The model uses the same backbone as every other run (see `README.md`, "Models"):
 

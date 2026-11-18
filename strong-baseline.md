@@ -6,9 +6,9 @@ Our strong baseline is a decoder-only Transformer with standard **causal softmax
 attention** (Vaswani et al., 2017) and rotary position embeddings (RoPE; Su et
 al., 2021), trained from scratch on our Recall / Update data. Softmax attention
 keeps every past token in its key-value cache, so it can look up the queried
-project directly, but its cost grows quadratically with context length. The
-efficient models in this project (linear attention, Gated DeltaNet, KDA) aim to
-match its retrieval accuracy with a fixed-size state.
+project directly, but its cost grows quadratically with context length. Linear
+attention (the simple baseline) tries to match its retrieval accuracy with a
+fixed-size state.
 
 We implemented the model in our own code base (`models/`). Every attention type
 shares the same backbone, so only the token mixer changes:
@@ -113,9 +113,7 @@ Comparison with the simple baseline (error columns are rates over all examples):
 With the same backbone, data and recipe, softmax attention almost solves the
 task at every context length up to 2,048 tokens. Its only 3 test errors are
 stale values on update examples (an earlier status of the queried project).
-Linear attention mostly returns another project's value. This
-gap is what our extensions (Gated DeltaNet and KDA, which add decay and the
-delta rule to the linear recurrence) try to close.
+Linear attention mostly returns another project's value.
 
 ## References
 
