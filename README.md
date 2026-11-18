@@ -11,9 +11,10 @@ CIS 5300 term project. We train small models from scratch with different attenti
 |---|---|---|
 | 1. Generate data | `python3 generate_data.py --out data` | `data/{train,dev,test}.jsonl`, `data/vocab.txt` |
 | 2. Validate data | `python3 validate_data.py data` | `data/validation_report.json` |
-| 3a. Train | `python train.py --attention softmax --out runs/softmax` | `runs/softmax/{best,last}.pt`, `metrics.jsonl` |
+| 3a. Train | `python train.py --attention softmax --out runs/softmax` | `runs/softmax/{best,last}.pt`, `metrics.jsonl`, and at the end `dev_pred.jsonl` + `dev_scores.json` |
 | 3b. Predict | `python predict.py --checkpoint runs/softmax/best.pt --split dev --out runs/softmax/dev_pred.jsonl` | `{"id": ..., "prediction": ...}` JSONL |
-| 4. Score | `python3 score.py --gold data/dev.jsonl --predictions PRED.jsonl` | accuracy + error breakdowns |
+| 4. Score | `python3 score.py --gold data/dev.jsonl --predictions PRED.jsonl` | accuracy + error breakdowns (3a already does this for dev) |
+| 5. Compare | `python3 summarize_runs.py` | one table across runs, `runs/summary.csv` |
 
 Instead of steps 1–2 you can run `tar -xzf data.tar.gz`, which gives byte-identical files. `make_archive.py data` rebuilds `data.tar.gz`.
 
@@ -36,10 +37,11 @@ models/               model code (needs PyTorch)
   attention.py        softmax | linear | gated_deltanet | kda token mixers
   model.py            shared backbone (embedding, pre-norm blocks, SwiGLU MLP, tied head)
   inference.py        greedy decoding, checkpoints, quick dev accuracy
-train.py              CLI: train one model
-predict.py            CLI: write predictions for score.py
-examples/             tiny gold/prediction fixture for score.py
-tests/                unit tests for the generator, the scorer and the models
+train.py              CLI: train one model (resumes automatically, scores dev at the end)
+predict.py            CLI: write predictions for score.py (test split needs --final)
+summarize_runs.py     CLI: compare finished runs (standard library only)
+notebooks/colab_train.ipynb   Colab setup + training, with runs saved to Google Drive
+tests/                unit tests for the generator, the scorer, the models and training
 ```
 
 Checkpoints, logs and predictions go under `runs/`, which is git-ignored like `data/`.
@@ -59,6 +61,8 @@ The backbone is the same for every run: token embedding, `n_layers` pre-norm blo
 
 GDN and KDA have more parameters in the mixer (convolutions and gates). `train.py` prints both counts, and the tests check that everything outside the mixer is identical.
 
+**Optional shared short convolution (`--short-conv 4`, off by default).** GDN and KDA include a short convolution inside the mixer, and softmax has RoPE, but linear attention has neither, so it has no easy way to link a project name to the value right after it. `--short-conv N` adds the same causal convolution (window N) before the mixer in every block, for every attention type. If the team uses it, use it for all models.
+
 ### CPU smoke test
 
 ```sh
@@ -71,7 +75,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 python3 score.py --gold runs/smoke/dev_gold.jsonl --predictions runs/smoke/dev_pred.jsonl
 ```
 
-The first run tokenizes every split once and caches it in `data/cache/`. `--write-gold` is needed when predicting on a subset, because `score.py` requires a prediction for every gold id. On CPU, `gated_deltanet` and `kda` use the step-by-step PyTorch reference, which is slow. Keep CPU runs at 128–256 tokens.
+On an Apple-silicon Mac, `--device auto` uses the GPU (MPS); CUDA is used when available. The first run tokenizes every split once and caches it in `data/cache/`. `--write-gold` is needed when predicting on a subset, because `score.py` requires a prediction for every gold id. On CPU, `gated_deltanet` and `kda` use the step-by-step PyTorch reference, which is slow. Keep CPU runs at 128–256 tokens.
 
 ### GPU runs
 
@@ -82,11 +86,15 @@ python generate_data.py --n-train 400000 --out data_big   # more training data; 
 for ATT in softmax linear gated_deltanet kda; do
   python train.py --attention $ATT --out runs/$ATT-s0 --seed 0 --data-dir data_big \
       --multi-query 16 --curriculum-steps 12000 --steps 20000 --max-tokens 65536
-  python predict.py --checkpoint runs/$ATT-s0/best.pt --split dev --out runs/$ATT-s0/dev_pred.jsonl
-  python score.py --gold data/dev.jsonl --predictions runs/$ATT-s0/dev_pred.jsonl \
-      --output runs/$ATT-s0/dev_scores.json
 done
+python3 summarize_runs.py
 ```
+
+Each run ends by predicting the full dev split with `best.pt` and writing `dev_pred.jsonl` and `dev_scores.json` (from `score.py`) into its folder; `--no-final-eval` skips this. With `--max-context-length`, only that part of dev is scored, and the matching gold file is written as `dev_gold.jsonl`.
+
+**On Colab**, open `notebooks/colab_train.ipynb` (A100 or L4 runtime). It clones the repo, unpacks the data, installs flash-linear-attention, keeps `runs/` in Google Drive, and uses one `FLAGS` setting for every model.
+
+**Resuming.** `last.pt` stores the optimizer, the batch sampler and the RNG states, and is written atomically at every evaluation. Rerunning the same command in the same `--out` continues from that step and gives the same result as an uninterrupted run. A run folder refuses different training settings (e.g. a changed `--steps`), so start a new `--out` instead. Settings that don't affect training (`--device`, `--log-every`, `--compile`) may change.
 
 The defaults are d_model 256, 4 layers, 4 heads, 32k tokens per batch, 20k steps, lr 1e-3 with warmup and cosine decay, and bf16 autocast. Batches come from one length bucket at a time, and `--curriculum-steps` unlocks the longer buckets gradually. Checkpoints are selected on a fixed 2,000-example dev subset (`--eval-examples`). Keep the same flags for every attention type, and change only `--attention` and `--seed`.
 
@@ -124,4 +132,4 @@ python3 -m unittest discover -s tests          # data + scoring (+ models if tor
 .venv/bin/python -m unittest discover -s tests # everything, using the venv
 ```
 
-Use `dev` for model selection. Keep `test` for the final evaluation.
+Use `dev` for model selection. Keep `test` for the final evaluation: `predict.py --split test` only runs with `--final`.

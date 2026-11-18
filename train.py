@@ -9,6 +9,10 @@ CPU smoke test (a few minutes):
 
 GPU run (see README for the full recipe):
     python train.py --attention gated_deltanet --out runs/gdn
+
+Rerunning the same command resumes from <out>/last.pt (e.g. after a Colab
+disconnect). When training ends, best.pt predicts the full dev split and
+score.py writes <out>/dev_scores.json.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import argparse
 import json
 import math
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -26,7 +31,8 @@ import torch.nn.functional as F
 
 from models.attention import ATTENTION
 from models.data import IGNORE_INDEX, BucketBatchSampler, Vocab, collate, load_split
-from models.inference import accuracy_report, autocast, pick_device, predict_split, save_checkpoint
+from models.inference import (accuracy_report, autocast, load_checkpoint, pick_device, predict_split,
+                              save_checkpoint, write_gold_subset, write_predictions)
 from models.model import LanguageModel, ModelConfig
 
 
@@ -43,6 +49,8 @@ def parse_args(argv=None):
     p.add_argument("--expand-v", type=float, default=1.0, help="GDN/KDA value expansion")
     p.add_argument("--kernel", default="auto", choices=["auto", "torch", "fla"],
                    help="GDN/KDA recurrence: fla Triton kernels (CUDA) or PyTorch reference")
+    p.add_argument("--short-conv", type=int, default=0,
+                   help="shared causal conv window before every mixer, for all attention types (0 = off)")
     # data
     p.add_argument("--max-context-length", type=int, default=None,
                    help="drop examples from longer buckets (train and dev)")
@@ -71,7 +79,76 @@ def parse_args(argv=None):
     p.add_argument("--eval-every", type=int, default=1000)
     p.add_argument("--patience", type=int, default=0,
                    help="stop after this many evals without dev improvement (0 = never)")
+    p.add_argument("--no-final-eval", action="store_true",
+                   help="skip predicting and scoring the full dev split at the end")
     return p.parse_args(argv)
+
+
+# Flags that don't change what the model learns, so a resumed run may change them.
+NON_RESULT_ARGS = {"out", "device", "compile", "no_final_eval", "log_every", "eval_max_tokens"}
+
+
+def check_run_dir(out: Path, args) -> None:
+    """Refuse to reuse a run directory with different training settings."""
+    path = out / "config.json"
+    if not path.exists():
+        return
+    saved = json.loads(path.read_text(encoding="utf-8")).get("args", {})
+    current = json.loads(json.dumps(vars(args)))
+    diff = sorted(k for k in current if k not in NON_RESULT_ARGS and k in saved and saved[k] != current[k])
+    if diff:
+        changes = ", ".join(f"{k}: {saved[k]!r} -> {current[k]!r}" for k in diff)
+        sys.exit(f"{out} was started with different settings ({changes}). "
+                 "Use a new --out, or rerun with the original flags to resume.")
+
+
+def truncate_metrics(path: Path, step: int) -> None:
+    """On resume, drop log lines written after the checkpoint (those steps are redone)."""
+    if not path.exists():
+        return
+    keep = []
+    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+        try:
+            if json.loads(line).get("step", 0) <= step:
+                keep.append(line)
+        except json.JSONDecodeError:   # half-written last line from a disconnect
+            pass
+    path.write_text("".join(keep), encoding="utf-8")
+
+
+def rng_state() -> dict:
+    state = {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state: dict) -> None:
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"].cpu())
+    if "cuda" in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in state["cuda"]])
+
+
+def final_dev_eval(args, out: Path, device: torch.device, amp: bool) -> None:
+    """Predict the full dev split (or the --max-context-length part of it) with
+    best.pt, and score it with score.py."""
+    from score import evaluate as score_evaluate
+
+    model, vocab, ckpt = load_checkpoint(out / "best.pt", device)
+    dev = load_split(args.data_dir, "dev", vocab, max_context_length=args.max_context_length)
+    preds = predict_split(model, dev, vocab, device, args.eval_max_tokens or args.max_tokens, amp=amp)
+    write_predictions(out / "dev_pred.jsonl", dev, preds)
+    gold = Path(args.data_dir) / "dev.jsonl"
+    if args.max_context_length is not None:
+        gold = out / "dev_gold.jsonl"
+        write_gold_subset(args.data_dir, "dev", dev.ids, gold)
+    report = score_evaluate(gold, out / "dev_pred.jsonl")
+    (out / "dev_scores.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    o = report["overall"]
+    print(f"full dev (best.pt from step {ckpt.get('step')}): accuracy {o['accuracy']:.4f} "
+          f"({o['correct']}/{o['n']}); errors {o['error_counts']}; scores in {out}/dev_scores.json")
 
 
 def lr_at(step, args):
@@ -101,6 +178,7 @@ def main(argv=None):
     args = parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    check_run_dir(out, args)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -121,7 +199,7 @@ def main(argv=None):
 
     cfg = ModelConfig(vocab_size=len(vocab), attention=args.attention, d_model=args.d_model,
                       n_layers=args.n_layers, n_heads=args.n_heads, mlp_ratio=args.mlp_ratio,
-                      expand_v=args.expand_v, kernel=args.kernel)
+                      expand_v=args.expand_v, kernel=args.kernel, short_conv=args.short_conv)
     model = LanguageModel(cfg).to(device)
     print(f"model: {args.attention}, {model.num_params():,} params "
           f"({model.num_mixer_params():,} in attention layers), device {device}")
@@ -135,13 +213,30 @@ def main(argv=None):
 
     (out / "config.json").write_text(json.dumps({"args": vars(args), "model": cfg.to_dict(),
                                                  "num_params": model.num_params()}, indent=2))
-    log = open(out / "metrics.jsonl", "a", encoding="utf-8")
-    best, evals_since_best = -1.0, 0
+    best, evals_since_best, start_step, finished = -1.0, 0, 0, False
     tokens_seen, tokens_window, t_last = 0, 0, time.time()
     loss_acc, acc_acc, ans_acc, n_acc = 0.0, 0.0, 0.0, 0
 
+    if (out / "last.pt").exists():
+        ckpt = torch.load(out / "last.pt", map_location=device, weights_only=False)
+        state = ckpt.get("train_state")
+        if state is None:
+            sys.exit(f"{out}/last.pt has no training state (written by an older train.py), "
+                     "so it can't be resumed. Use a new --out.")
+        model.load_state_dict(ckpt["model"])
+        opt.load_state_dict(state["optimizer"])
+        sampler.load_state_dict(state["sampler"])
+        set_rng_state(state["rng"])
+        if "query_rng" in state:   # absent in runs started before --multi-query existed
+            query_rng.setstate(state["query_rng"])
+        best, evals_since_best = state["best"], state["evals_since_best"]
+        start_step, finished, tokens_seen = state["step"], state["finished"], state["tokens_seen"]
+        truncate_metrics(out / "metrics.jsonl", start_step)
+        print(f"resuming {out} at step {start_step}" + (" (training already finished)" if finished else ""))
+    log = open(out / "metrics.jsonl", "a", encoding="utf-8")
+
     def evaluate(step):
-        nonlocal best, evals_since_best
+        nonlocal best, evals_since_best, finished
         t = time.time()
         preds = predict_split(model, dev, vocab, device, eval_max_tokens, amp=amp)
         rep = accuracy_report(dev, vocab, preds)
@@ -152,7 +247,12 @@ def main(argv=None):
             save_checkpoint(out / "best.pt", model, vocab, step=step, dev=rep, args=vars(args))
         else:
             evals_since_best += 1
-        save_checkpoint(out / "last.pt", model, vocab, step=step, dev=rep, args=vars(args))
+        finished = step >= args.steps or bool(args.patience and evals_since_best >= args.patience)
+        train_state = {"step": step, "finished": finished, "optimizer": opt.state_dict(),
+                       "sampler": sampler.state_dict(), "rng": rng_state(), "query_rng": query_rng.getstate(), "best": best,
+                       "evals_since_best": evals_since_best, "tokens_seen": tokens_seen}
+        save_checkpoint(out / "last.pt", model, vocab, step=step, dev=rep, args=vars(args),
+                        train_state=train_state)
         print(f"eval step {step}: dev acc {rep['all']:.4f} (best {best:.4f}) "
               + " ".join(f"{k}={v:.3f}" for k, v in rep.items() if k != "all")
               + f" [{time.time() - t:.1f}s]", flush=True)
@@ -160,7 +260,7 @@ def main(argv=None):
         log.flush()
 
     model.train()
-    for step in range(args.steps):
+    for step in range(start_step, 0 if finished else args.steps):
         lr = lr_at(step, args)
         for group in opt.param_groups:
             group["lr"] = lr
@@ -209,6 +309,8 @@ def main(argv=None):
                 break
     log.close()
     print(f"done. best dev acc {best:.4f}; checkpoints in {out}/best.pt and {out}/last.pt")
+    if not args.no_final_eval:
+        final_dev_eval(args, out, device, amp)
 
 
 if __name__ == "__main__":

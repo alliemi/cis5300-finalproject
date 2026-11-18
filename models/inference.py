@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -14,9 +17,14 @@ from .model import LanguageModel, ModelConfig
 
 
 def pick_device(name: str = "auto") -> torch.device:
-    if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(name)
+    """auto: CUDA, then Apple-silicon GPU (MPS), then CPU."""
+    if name != "auto":
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def autocast(device: torch.device, enabled: bool = True):
@@ -96,8 +104,33 @@ def accuracy_report(split: EncodedSplit, vocab: Vocab, preds: Dict[str, str]) ->
 
 
 def save_checkpoint(path, model: LanguageModel, vocab: Vocab, **extra):
+    """Write atomically (temp file + rename), so a disconnect mid-save can't
+    leave a corrupt checkpoint behind."""
     state = {k: v for k, v in model.state_dict().items()}
-    torch.save({"config": model.cfg.to_dict(), "model": state, "vocab": vocab.itos, **extra}, path)
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save({"config": model.cfg.to_dict(), "model": state, "vocab": vocab.itos, **extra}, tmp)
+    os.replace(tmp, path)
+
+
+def write_gold_subset(data_dir, split: str, ids, path) -> None:
+    """Copy the gold records for `ids` (score.py needs a prediction for every gold id)."""
+    keep = set(ids)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(Path(data_dir) / f"{split}.jsonl", encoding="utf-8") as src, \
+            open(path, "w", encoding="utf-8") as dst:
+        for line in src:
+            if json.loads(line)["id"] in keep:
+                dst.write(line)
+
+
+def write_predictions(path, split: EncodedSplit, preds: Dict[str, str]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for ex_id in split.ids:
+            f.write(json.dumps({"id": ex_id, "prediction": preds[ex_id]}) + "\n")
 
 
 def load_checkpoint(path, device: torch.device, kernel: Optional[str] = None):

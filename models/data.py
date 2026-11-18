@@ -292,6 +292,14 @@ class BucketBatchSampler:
         self.weights = [len(g) / bs for g, bs in zip(self.groups, self.batch_sizes)]
         self._perm = [[] for _ in self.groups]
 
+    def state_dict(self) -> Dict:
+        """Everything needed to continue the exact same batch sequence after a resume."""
+        return {"rng": self.rng.getstate(), "perm": [list(p) for p in self._perm]}
+
+    def load_state_dict(self, state: Dict) -> None:
+        self.rng.setstate(state["rng"])
+        self._perm = [list(p) for p in state["perm"]]
+
     def allowed(self, step: int) -> int:
         if self.curriculum_steps <= 0:
             return len(self.buckets)
