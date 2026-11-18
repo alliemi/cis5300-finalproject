@@ -6,6 +6,7 @@ Skipped entirely when PyTorch is not installed.
 """
 
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,8 +23,8 @@ if HAVE_TORCH:
     import torch.nn.functional as F
     from models.attention import (ATTENTION, build_attention, delta_rule_recurrent, _fla_kernel,
                                   linear_attention_chunked, linear_attention_recurrent)
-    from models.data import (IGNORE_INDEX, BucketBatchSampler, Vocab, collate, encode_record,
-                             eval_batches, load_split)
+    from models.data import (EXTRA_QUERY_LEN, IGNORE_INDEX, BucketBatchSampler, Vocab, collate,
+                             encode_record, eval_batches, load_split)
     from models.inference import greedy_decode, load_checkpoint, save_checkpoint
     from models.model import LanguageModel, ModelConfig
 
@@ -211,6 +212,11 @@ class DataPipelineTest(unittest.TestCase):
             {"id": "x-3", "task": "update", "context_length": 128,
              "context": "Project Shark status: jasmine. Project Shark is velvet.",
              "query": "What is the current status of Project Shark?", "answer": "velvet"},
+            {"id": "x-4", "task": "update", "context_length": 128,
+             "context": "Project Trout status: oasis. Project Heron is red. The team lunch ran late "
+                        "on Friday. Project Falcon is pending. Project Trout is merged. "
+                        "The status of Project Heron is blue.",
+             "query": "What is the current status of Project Trout?", "answer": "merged"},
         ]
         (d / "dev.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
         cls.dir, cls.recs = d, recs
@@ -227,41 +233,85 @@ class DataPipelineTest(unittest.TestCase):
 
     def test_encode_format(self):
         v = self.vocab
-        seq, plen = encode_record(self.recs[0], v)
+        seq, plen, _ = encode_record(self.recs[0], v)
         self.assertEqual(seq[0], v.bos_id)
         self.assertEqual(seq[plen - 1], v.sep_id)
         self.assertEqual([v.itos[i] for i in seq[plen:]], ["oasis", "<eos>"])
         self.assertEqual(sum(1 for i in seq if i == v.sep_id), 2)
         self.assertEqual(v.decode(seq[plen:]), "oasis")
 
+    def test_encode_extra_pairs_are_other_projects_current_values(self):
+        v = self.vocab
+        _, _, extra = encode_record(self.recs[3], v)
+        self.assertEqual([(v.itos[e], v.itos[val]) for e, val in extra],
+                         [("Heron", "blue"), ("Falcon", "pending")])
+        self.assertEqual(encode_record(self.recs[0], v)[2], [])
+        bad = dict(self.recs[3], answer="oasis")      # stale value given as answer
+        with self.assertRaises(ValueError):
+            encode_record(bad, v)
+
     def test_load_split_and_cache(self):
         a = load_split(self.dir, "dev", self.vocab)
         b = load_split(self.dir, "dev", self.vocab)      # from cache
         self.assertEqual(a.ids, b.ids)
         self.assertTrue((a.tokens == b.tokens).all())
+        self.assertTrue((a.extra == b.extra).all())
         short = load_split(self.dir, "dev", self.vocab, max_context_length=128)
-        self.assertEqual(short.ids, ["x-1", "x-3"])
+        self.assertEqual(short.ids, ["x-1", "x-3", "x-4"])
+        self.assertEqual(short.num_extra(2), 2)          # extra pairs survive subsetting
         self.assertEqual(len(load_split(self.dir, "dev", self.vocab, max_examples=2, seed=1)), 2)
 
     def test_collate_supervises_only_answer_and_eos(self):
         split = load_split(self.dir, "dev", self.vocab)
-        x, y = collate(split, [0, 1], self.vocab.pad_id)
-        for row in range(2):
-            p, n = int(split.prompt_lens[row]), split.seq_len(row)
+        x, y, official = collate(split, [0, 1, 3], self.vocab)
+        for row, i in enumerate([0, 1, 3]):
+            p, n = int(split.prompt_lens[i]), split.seq_len(i)
             labels = y[row][y[row] != IGNORE_INDEX].tolist()
-            self.assertEqual(labels, split.seq(row)[p:].tolist())
+            self.assertEqual(labels, split.seq(i)[p:].tolist())
             self.assertEqual(x[row, p - 1].item(), self.vocab.sep_id)   # predicts the answer
             self.assertTrue((x[row, n - 1:] == self.vocab.pad_id).all())
+            self.assertEqual(official[row].nonzero().flatten().tolist(), [p - 1])
+
+    def test_collate_multi_query(self):
+        v = self.vocab
+        split = load_split(self.dir, "dev", v)
+        x, y, official = collate(split, [3], v, max_extra=-1, rng=random.Random(0))
+        p = int(split.prompt_lens[3])
+        # prompt is untouched, so evaluation (which decodes after the prompt) is unchanged
+        self.assertEqual(x[0, :p].tolist(), split.seq(3)[:p].tolist())
+        self.assertEqual(official[0].nonzero().flatten().tolist(), [p - 1])
+        self.assertEqual(y[0, p - 1].item(), v.stoi["merged"])
+        # labels: official answer, then each other project's current value, then <eos>
+        labels = [v.itos[t] for t in y[0][y[0] != IGNORE_INDEX].tolist()]
+        self.assertEqual(labels[0], "merged")
+        self.assertEqual(sorted(labels[1:-1]), ["blue", "pending"])
+        self.assertEqual(labels[-1], "<eos>")
+        # each extra value is predicted right after "<sep> What is ... Project E ? <sep>"
+        text = [v.itos[t] for t in x[0].tolist()]
+        for pos in (y[0] != IGNORE_INDEX).nonzero().flatten().tolist()[1:-1]:
+            self.assertEqual(text[pos], "<sep>")
+            entity = text[pos - 2]
+            q_len = EXTRA_QUERY_LEN - 3
+            self.assertEqual(text[pos - q_len:pos], [v.itos[t] for t in v.query_ids(v.stoi[entity])])
+            self.assertEqual(text[pos - q_len - 1], "<sep>")
+            self.assertEqual({"Heron": "blue", "Falcon": "pending"}[entity], v.itos[y[0, pos].item()])
+        self.assertEqual(len(split.seq(3)) + 2 * EXTRA_QUERY_LEN, x.shape[1] + 1)
+        # a cap of 1 adds exactly one extra query
+        x1, y1, _ = collate(split, [3], v, max_extra=1, rng=random.Random(0))
+        self.assertEqual((y1 != IGNORE_INDEX).sum().item(), 3)
+        self.assertEqual(split.train_len(3, 1), x1.shape[1] + 1)
 
     def test_samplers(self):
         split = load_split(self.dir, "dev", self.vocab)
         s = BucketBatchSampler(split, max_tokens=10_000, seed=0, curriculum_steps=10)
+        s_mq = BucketBatchSampler(split, max_tokens=10_000, seed=0, max_extra=-1)
+        self.assertLess(s_mq.batch_sizes[0], s.batch_sizes[0])   # room for the extra queries
         self.assertEqual(s.allowed(0), 1)
         self.assertEqual(s.allowed(10), 2)
         for step in range(5):     # curriculum: only the 128 bucket at the start
             self.assertTrue(all(split.buckets[i] == 128 for i in s.batch(step)))
         covered = sorted(i for b in eval_batches(split, 40) for i in b)
-        self.assertEqual(covered, [0, 1, 2])
+        self.assertEqual(covered, [0, 1, 2, 3])
 
     def test_greedy_decode_returns_tokens(self):
         split = load_split(self.dir, "dev", self.vocab)
@@ -276,7 +326,7 @@ class DataPipelineTest(unittest.TestCase):
         split = load_split(self.dir, "dev", self.vocab)
         m = LanguageModel(tiny_cfg("softmax", vocab_size=len(self.vocab)))
         opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
-        x, y = collate(split, [0, 1, 2], self.vocab.pad_id)
+        x, y, _ = collate(split, [0, 1, 2], self.vocab)
         for _ in range(150):
             sel = y != IGNORE_INDEX
             loss = F.cross_entropy(m.head(m.hidden(x)[sel]), y[sel])

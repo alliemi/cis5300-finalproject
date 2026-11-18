@@ -29,6 +29,9 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--max-examples", type=int, default=None)
     p.add_argument("--max-context-length", type=int, default=None)
+    p.add_argument("--subset-seed", type=int, default=12345,
+                   help="seed for --max-examples; 12345 matches train.py's dev subset, "
+                        "train.py's --seed matches its train subset")
     p.add_argument("--write-gold", default=None, help="write the gold records of the predicted subset here")
     p.add_argument("--max-tokens", type=int, default=65536, help="tokens per batch")
     p.add_argument("--max-new-tokens", type=int, default=2)
@@ -42,7 +45,7 @@ def main(argv=None):
     model, vocab, ckpt = load_checkpoint(args.checkpoint, device, kernel=args.kernel)
     print(f"loaded {args.checkpoint}: {model.cfg.attention}, step {ckpt.get('step')}, device {device}")
     split = load_split(args.data_dir, args.split, vocab, max_examples=args.max_examples,
-                       max_context_length=args.max_context_length, seed=12345)
+                       max_context_length=args.max_context_length, seed=args.subset_seed)
     t = time.time()
     preds = predict_split(model, split, vocab, device, args.max_tokens, args.max_new_tokens,
                           amp=not args.no_amp, progress=True)
