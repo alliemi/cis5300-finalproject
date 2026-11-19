@@ -42,8 +42,6 @@ Shared with the simple baseline (`simple-baseline.md`); only `--attention` diffe
 | `models/inference.py` | Greedy decoding, checkpoints, dev accuracy |
 | `train.py` | Training CLI (resumes from `last.pt`, scores the full dev split at the end) |
 | `predict.py` | Writes `{"id", "prediction"}` JSONL for `score.py` |
-| `notebooks/colab_train.ipynb` | Colab setup that runs the same commands |
-| `tests/test_models.py`, `tests/test_training.py` | Causality, shared-backbone and training/resume tests |
 
 ## How to run
 
