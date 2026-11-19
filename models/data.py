@@ -6,6 +6,15 @@ Every example becomes one token sequence
 
 The prompt is everything up to and including the second <sep>. Training
 supervises only the tokens after the prompt (the answer and <eos>).
+
+Multi-query training (`max_extra > 0` in `collate`) appends questions about
+other projects in the same context, so one sequence supervises many answers:
+
+    <bos> context <sep> query <sep> answer  (<sep> query_e <sep> value_e)*  <eos>
+
+The official query always comes first, so evaluation (which decodes only
+after the official prompt) is unchanged. The extra answers come from the
+independent fact parser in synthdata/errors.py.
 """
 
 from __future__ import annotations
@@ -20,12 +29,15 @@ from typing import Dict, Iterator, List, Optional, Sequence
 import numpy as np
 import torch
 
+from synthdata.errors import parse_facts, parse_query, value_history
 from synthdata.tokenizer import SPECIAL_TOKENS, render, tokenize
+from synthdata.wordlists import QUERY_TEMPLATE
 
 PAD, BOS, SEP, EOS = SPECIAL_TOKENS
 IGNORE_INDEX = -100
 TASK_IDS = {"recall": 0, "update": 1}
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+EXTRA_QUERY_LEN = len(QUERY_TEMPLATE) + 3   # <sep> query <sep> value
 
 
 class Vocab:
@@ -63,16 +75,31 @@ class Vocab:
             out.append(self.itos[i])
         return render(out)
 
+    def query_ids(self, entity_id: int) -> List[int]:
+        """Token ids of the query template for the given project-name token."""
+        if not hasattr(self, "_query_parts"):
+            self._query_parts = [None if w == "{E}" else self.stoi[w] for w in QUERY_TEMPLATE]
+        return [entity_id if t is None else t for t in self._query_parts]
+
     def fingerprint(self) -> str:
         return hashlib.sha1("\n".join(self.itos).encode()).hexdigest()[:10]
 
 
 def encode_record(rec: Dict, vocab: Vocab):
-    """Return (full token ids, prompt length)."""
+    """Return (full token ids, prompt length, extra (entity id, value id) pairs).
+
+    The extra pairs give every *other* project in the context with its current
+    (last stated) value, in order of first mention; they feed multi-query training.
+    """
     prompt = ([vocab.bos_id] + vocab.encode(tokenize(rec["context"])) + [vocab.sep_id]
               + vocab.encode(tokenize(rec["query"])) + [vocab.sep_id])
     target = vocab.encode(tokenize(rec["answer"])) + [vocab.eos_id]
-    return prompt + target, len(prompt)
+    hist = value_history(parse_facts(rec["context"]))
+    entity = parse_query(rec["query"])
+    if entity not in hist or hist[entity][-1] != rec["answer"]:
+        raise ValueError(f"{rec.get('id')}: parsed current value of {entity} does not match answer")
+    extra = [(vocab.stoi[e], vocab.stoi[vals[-1]]) for e, vals in hist.items() if e != entity]
+    return prompt + target, len(prompt), extra
 
 
 @dataclass
@@ -84,6 +111,8 @@ class EncodedSplit:
     buckets: np.ndarray      # int32, dataset `context_length` bucket
     tasks: np.ndarray        # int8, 0 = recall, 1 = update
     ids: List[str]
+    extra: np.ndarray        # int16 (M, 2): (entity id, current value id) of other projects
+    extra_offsets: np.ndarray  # int64, len n+1
 
     def __len__(self) -> int:
         return len(self.ids)
@@ -94,38 +123,60 @@ class EncodedSplit:
     def seq_len(self, i: int) -> int:
         return int(self.offsets[i + 1] - self.offsets[i])
 
+    def extra_pairs(self, i: int) -> np.ndarray:
+        return self.extra[self.extra_offsets[i]:self.extra_offsets[i + 1]]
+
+    def num_extra(self, i: int) -> int:
+        return int(self.extra_offsets[i + 1] - self.extra_offsets[i])
+
+    def train_len(self, i: int, max_extra: int = 0) -> int:
+        """Sequence length including up to `max_extra` extra queries (-1 = all)."""
+        k = self.num_extra(i) if max_extra < 0 else min(max_extra, self.num_extra(i))
+        return self.seq_len(i) + k * EXTRA_QUERY_LEN
+
     def subset(self, indices: Sequence[int]) -> "EncodedSplit":
         indices = list(indices)
-        seqs = [self.seq(i) for i in indices]
-        lens = np.array([len(s) for s in seqs], dtype=np.int64)
-        offsets = np.zeros(len(seqs) + 1, dtype=np.int64)
-        np.cumsum(lens, out=offsets[1:])
+        tokens, offsets = _flatten([self.seq(i) for i in indices], np.int16)
+        extra, extra_offsets = _flatten([self.extra_pairs(i) for i in indices], np.int16, width=2)
         return EncodedSplit(
-            tokens=np.concatenate(seqs) if seqs else np.zeros(0, np.int16),
+            tokens=tokens,
             offsets=offsets,
             prompt_lens=self.prompt_lens[indices],
             buckets=self.buckets[indices],
             tasks=self.tasks[indices],
             ids=[self.ids[i] for i in indices],
+            extra=extra,
+            extra_offsets=extra_offsets,
         )
 
 
+def _flatten(arrays, dtype, width: Optional[int] = None):
+    """Concatenate arrays and return (flat array, offsets)."""
+    lens = np.array([len(a) for a in arrays], dtype=np.int64)
+    offsets = np.zeros(len(arrays) + 1, dtype=np.int64)
+    np.cumsum(lens, out=offsets[1:])
+    shape = (0,) if width is None else (0, width)
+    flat = np.concatenate([np.asarray(a, dtype=dtype).reshape((-1,) + shape[1:]) for a in arrays]) \
+        if arrays else np.zeros(shape, dtype)
+    return flat.astype(dtype, copy=False), offsets
+
+
 def _encode_file(path: Path, vocab: Vocab) -> EncodedSplit:
-    seqs, prompt_lens, buckets, tasks, ids = [], [], [], [], []
+    seqs, extras, prompt_lens, buckets, tasks, ids = [], [], [], [], [], []
     with open(path, encoding="utf-8") as f:
         for line in f:
             rec = json.loads(line)
-            seq, plen = encode_record(rec, vocab)
+            seq, plen, extra = encode_record(rec, vocab)
             seqs.append(np.asarray(seq, dtype=np.int16))
+            extras.append(np.asarray(extra, dtype=np.int16).reshape(-1, 2))
             prompt_lens.append(plen)
             buckets.append(rec["context_length"])
             tasks.append(TASK_IDS[rec["task"]])
             ids.append(rec["id"])
-    lens = np.array([len(s) for s in seqs], dtype=np.int64)
-    offsets = np.zeros(len(seqs) + 1, dtype=np.int64)
-    np.cumsum(lens, out=offsets[1:])
-    return EncodedSplit(np.concatenate(seqs), offsets, np.array(prompt_lens, np.int32),
-                        np.array(buckets, np.int32), np.array(tasks, np.int8), ids)
+    tokens, offsets = _flatten(seqs, np.int16)
+    extra, extra_offsets = _flatten(extras, np.int16, width=2)
+    return EncodedSplit(tokens, offsets, np.array(prompt_lens, np.int32), np.array(buckets, np.int32),
+                        np.array(tasks, np.int8), ids, extra, extra_offsets)
 
 
 def load_split(data_dir, split: str, vocab: Vocab, *, max_examples: Optional[int] = None,
@@ -142,14 +193,15 @@ def load_split(data_dir, split: str, vocab: Vocab, *, max_examples: Optional[int
     if use_cache and cache.exists() and cache.stat().st_mtime >= path.stat().st_mtime:
         z = np.load(cache, allow_pickle=False)
         enc = EncodedSplit(z["tokens"], z["offsets"], z["prompt_lens"], z["buckets"],
-                           z["tasks"], z["ids"].tolist())
+                           z["tasks"], z["ids"].tolist(), z["extra"], z["extra_offsets"])
     else:
         enc = _encode_file(path, vocab)
         if use_cache:
             cache.parent.mkdir(parents=True, exist_ok=True)
             tmp = cache.with_suffix(".tmp.npz")
             np.savez(tmp, tokens=enc.tokens, offsets=enc.offsets, prompt_lens=enc.prompt_lens,
-                     buckets=enc.buckets, tasks=enc.tasks, ids=np.array(enc.ids))
+                     buckets=enc.buckets, tasks=enc.tasks, ids=np.array(enc.ids),
+                     extra=enc.extra, extra_offsets=enc.extra_offsets)
             tmp.replace(cache)
 
     keep = list(range(len(enc)))
@@ -164,18 +216,55 @@ def load_split(data_dir, split: str, vocab: Vocab, *, max_examples: Optional[int
     return enc
 
 
-def collate(split: EncodedSplit, indices: Sequence[int], pad_id: int):
-    """Teacher-forcing batch: inputs = seq[:-1], labels = seq[1:] on target tokens only."""
-    T = max(split.seq_len(i) for i in indices) - 1
-    x = torch.full((len(indices), T), pad_id, dtype=torch.long)
+def build_training_sequence(split: EncodedSplit, i: int, vocab: Vocab, max_extra: int = 0,
+                            rng: Optional[random.Random] = None):
+    """Return (tokens, supervised, official): per-token lists, where `supervised[j]`
+    means token j is a training target (predicted from position j-1) and
+    `official[j]` marks the official answer token(s).
+
+    max_extra: 0 = official query only; K > 0 = up to K extra queries about other
+    projects, sampled without replacement in random order; -1 = all of them.
+    """
+    s = split.seq(i).astype(np.int64).tolist()
+    p = int(split.prompt_lens[i])
+    answer = s[p:-1]                                   # stored seq ends with <eos>
+    tokens = s[:p] + answer
+    supervised = [False] * p + [True] * len(answer)
+    official = list(supervised)
+    pairs = split.extra_pairs(i)
+    if max_extra and len(pairs):
+        k = len(pairs) if max_extra < 0 else min(max_extra, len(pairs))
+        rng = rng or random
+        for c in rng.sample(range(len(pairs)), k):
+            entity, value = int(pairs[c][0]), int(pairs[c][1])
+            q = [vocab.sep_id] + vocab.query_ids(entity) + [vocab.sep_id]
+            tokens += q + [value]
+            supervised += [False] * len(q) + [True]
+            official += [False] * (len(q) + 1)
+    tokens.append(vocab.eos_id)
+    supervised.append(True)
+    official.append(False)
+    return tokens, supervised, official
+
+
+def collate(split: EncodedSplit, indices: Sequence[int], vocab: Vocab, max_extra: int = 0,
+            rng: Optional[random.Random] = None):
+    """Teacher-forcing batch. Returns (x, y, official):
+    x = tokens[:-1]; y = tokens[1:] on supervised tokens, IGNORE_INDEX elsewhere;
+    official = bool mask of y positions holding the official answer."""
+    built = [build_training_sequence(split, i, vocab, max_extra, rng) for i in indices]
+    T = max(len(t) for t, _, _ in built) - 1
+    x = torch.full((len(indices), T), vocab.pad_id, dtype=torch.long)
     y = torch.full((len(indices), T), IGNORE_INDEX, dtype=torch.long)
-    for row, i in enumerate(indices):
-        s = torch.from_numpy(split.seq(i).astype(np.int64))
-        n = len(s) - 1
-        x[row, :n] = s[:-1]
-        p = int(split.prompt_lens[i])
-        y[row, p - 1:n] = s[p:]          # position p-1 (the last <sep>) predicts the answer
-    return x, y
+    official = torch.zeros((len(indices), T), dtype=torch.bool)
+    for row, (tokens, sup, off) in enumerate(built):
+        t = torch.tensor(tokens, dtype=torch.long)
+        n = len(tokens) - 1
+        x[row, :n] = t[:-1]
+        mask = torch.tensor(sup[1:], dtype=torch.bool)
+        y[row, :n] = torch.where(mask, t[1:], torch.full_like(t[1:], IGNORE_INDEX))
+        official[row, :n] = torch.tensor(off[1:], dtype=torch.bool)
+    return x, y, official
 
 
 class BucketBatchSampler:
@@ -190,7 +279,7 @@ class BucketBatchSampler:
     """
 
     def __init__(self, split: EncodedSplit, max_tokens: int, seed: int = 0,
-                 curriculum_steps: int = 0):
+                 curriculum_steps: int = 0, max_extra: int = 0):
         self.rng = random.Random(seed)
         self.curriculum_steps = curriculum_steps
         groups: Dict[int, List[int]] = {}
@@ -198,7 +287,8 @@ class BucketBatchSampler:
             groups.setdefault(b, []).append(i)
         self.buckets = sorted(groups)
         self.groups = [groups[b] for b in self.buckets]
-        self.batch_sizes = [max(1, max_tokens // max(split.seq_len(i) for i in g)) for g in self.groups]
+        self.batch_sizes = [max(1, max_tokens // max(split.train_len(i, max_extra) for i in g))
+                            for g in self.groups]
         self.weights = [len(g) / bs for g, bs in zip(self.groups, self.batch_sizes)]
         self._perm = [[] for _ in self.groups]
 

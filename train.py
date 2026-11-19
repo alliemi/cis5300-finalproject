@@ -8,7 +8,7 @@ CPU smoke test (a few minutes):
         --steps 300 --max-tokens 4096 --eval-every 100
 
 GPU run (see README for the full recipe):
-    python train.py --attention gated_deltanet --out runs/gdn
+    python train.py --attention linear --out runs/linear
 
 Rerunning the same command resumes from <out>/last.pt (e.g. after a Colab
 disconnect). When training ends, best.pt predicts the full dev split and
@@ -46,9 +46,6 @@ def parse_args(argv=None):
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--mlp-ratio", type=float, default=4.0)
-    p.add_argument("--expand-v", type=float, default=1.0, help="GDN/KDA value expansion")
-    p.add_argument("--kernel", default="auto", choices=["auto", "torch", "fla"],
-                   help="GDN/KDA recurrence: fla Triton kernels (CUDA) or PyTorch reference")
     p.add_argument("--short-conv", type=int, default=0,
                    help="shared causal conv window before every mixer, for all attention types (0 = off)")
     # data
@@ -58,6 +55,9 @@ def parse_args(argv=None):
     p.add_argument("--eval-examples", type=int, default=2000, help="dev subset used during training")
     p.add_argument("--max-tokens", type=int, default=32768, help="tokens per training batch")
     p.add_argument("--eval-max-tokens", type=int, default=None, help="tokens per eval batch")
+    p.add_argument("--multi-query", type=int, default=0,
+                   help="extra training queries per example about other projects in the context "
+                        "(0 = off, -1 = all); evaluation always uses only the official query")
     p.add_argument("--curriculum-steps", type=int, default=0,
                    help="unlock length buckets short-to-long over this many steps (0 = off)")
     # optimization
@@ -196,7 +196,7 @@ def main(argv=None):
 
     cfg = ModelConfig(vocab_size=len(vocab), attention=args.attention, d_model=args.d_model,
                       n_layers=args.n_layers, n_heads=args.n_heads, mlp_ratio=args.mlp_ratio,
-                      expand_v=args.expand_v, kernel=args.kernel, short_conv=args.short_conv)
+                      short_conv=args.short_conv)
     model = LanguageModel(cfg).to(device)
     print(f"model: {args.attention}, {model.num_params():,} params "
           f"({model.num_mixer_params():,} in attention layers), device {device}")
@@ -204,13 +204,15 @@ def main(argv=None):
     hidden_fn = torch.compile(model.hidden, dynamic=True) if args.compile else model.hidden
     opt = make_optimizer(model, args, device)
     sampler = BucketBatchSampler(train, args.max_tokens, seed=args.seed,
-                                 curriculum_steps=args.curriculum_steps)
+                                 curriculum_steps=args.curriculum_steps, max_extra=args.multi_query)
+    query_rng = random.Random(args.seed + 1)
     eval_max_tokens = args.eval_max_tokens or args.max_tokens
 
     (out / "config.json").write_text(json.dumps({"args": vars(args), "model": cfg.to_dict(),
                                                  "num_params": model.num_params()}, indent=2))
     best, evals_since_best, start_step, finished = -1.0, 0, 0, False
-    tokens_seen, tokens_window, t_last, loss_acc, acc_acc, n_acc = 0, 0, time.time(), 0.0, 0.0, 0
+    tokens_seen, tokens_window, t_last = 0, 0, time.time()
+    loss_acc, acc_acc, ans_acc, n_acc = 0.0, 0.0, 0.0, 0
 
     if (out / "last.pt").exists():
         ckpt = torch.load(out / "last.pt", map_location=device, weights_only=False)
@@ -222,6 +224,8 @@ def main(argv=None):
         opt.load_state_dict(state["optimizer"])
         sampler.load_state_dict(state["sampler"])
         set_rng_state(state["rng"])
+        if "query_rng" in state:   # absent in runs started before --multi-query existed
+            query_rng.setstate(state["query_rng"])
         best, evals_since_best = state["best"], state["evals_since_best"]
         start_step, finished, tokens_seen = state["step"], state["finished"], state["tokens_seen"]
         truncate_metrics(out / "metrics.jsonl", start_step)
@@ -242,7 +246,7 @@ def main(argv=None):
             evals_since_best += 1
         finished = step >= args.steps or bool(args.patience and evals_since_best >= args.patience)
         train_state = {"step": step, "finished": finished, "optimizer": opt.state_dict(),
-                       "sampler": sampler.state_dict(), "rng": rng_state(), "best": best,
+                       "sampler": sampler.state_dict(), "rng": rng_state(), "query_rng": query_rng.getstate(), "best": best,
                        "evals_since_best": evals_since_best, "tokens_seen": tokens_seen}
         save_checkpoint(out / "last.pt", model, vocab, step=step, dev=rep, args=vars(args),
                         train_state=train_state)
@@ -258,8 +262,9 @@ def main(argv=None):
         for group in opt.param_groups:
             group["lr"] = lr
         idx = sampler.batch(step)
-        x, y = collate(train, idx, vocab.pad_id)
+        x, y, official = collate(train, idx, vocab, args.multi_query, query_rng)
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        official = official.to(device, non_blocking=True)
         with autocast(device, amp):
             h = hidden_fn(x)
             sel = y != IGNORE_INDEX
@@ -273,24 +278,29 @@ def main(argv=None):
         tokens_seen += x.numel()
         tokens_window += x.numel()
         loss_acc += loss.item()
-        # teacher-forced accuracy over supervised tokens (answer and <eos>)
-        acc_acc += (logits.argmax(-1) == y[sel]).float().mean().item()
+        # teacher-forced accuracy: tok_acc over all supervised tokens (answers, <eos>),
+        # ans_acc over the official answers only (comparable with dev accuracy)
+        hit = logits.argmax(-1) == y[sel]
+        acc_acc += hit.float().mean().item()
+        ans_acc += hit[official[sel]].float().mean().item()
         n_acc += 1
         if (step + 1) % args.log_every == 0:
             dt = time.time() - t_last
             rec = {"type": "train", "step": step + 1, "loss": loss_acc / n_acc, "tok_acc": acc_acc / n_acc,
+                   "ans_acc": ans_acc / n_acc,
                    "lr": lr, "grad_norm": float(gnorm), "tokens": tokens_seen,
                    "max_bucket": sampler.buckets[sampler.allowed(step) - 1],
                    "tok_per_s": int(tokens_window / dt)}
             tokens_window = 0
-            print(f"step {step + 1}/{args.steps} loss {rec['loss']:.4f} tok_acc {rec['tok_acc']:.3f} "
+            print(f"step {step + 1}/{args.steps} loss {rec['loss']:.4f} tok_acc {rec['tok_acc']:.3f} ans_acc {rec['ans_acc']:.3f} "
                   f"lr {lr:.2e} gnorm {rec['grad_norm']:.2f} max_len {rec['max_bucket']} "
                   f"~{rec['tok_per_s']:,} tok/s", flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
-            t_last, loss_acc, acc_acc, n_acc = time.time(), 0.0, 0.0, 0
+            t_last, loss_acc, acc_acc, ans_acc, n_acc = time.time(), 0.0, 0.0, 0.0, 0
         if (step + 1) % args.eval_every == 0 or step + 1 == args.steps:
             evaluate(step + 1)
+            t_last = time.time()      # keep eval time out of the tok/s reading
             if args.patience and evals_since_best >= args.patience:
                 print(f"early stop: no dev improvement in {args.patience} evals")
                 break

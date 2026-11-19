@@ -1,23 +1,13 @@
 """Token-mixing layers, swappable by name. Every layer maps (B, T, D) -> (B, T, D)
 and is causal: the output at position t depends only on inputs at positions <= t.
 
-    softmax         causal softmax attention with RoPE (strong baseline)
-    linear          linear attention, phi = elu + 1 (Katharopoulos et al., 2020)
-    gated_deltanet  Gated DeltaNet (Yang et al., 2025): scalar decay per head + delta rule
-    kda             Kimi Delta Attention (Kimi Team, 2025): per-channel decay + delta rule
-
-The two delta-rule layers share one module; they differ only in the decay
-gate and the output gate. Their recurrence runs either in pure PyTorch
-(`delta_rule_recurrent`, a slow, exact reference used on CPU and in tests) or
-in the flash-linear-attention (fla) Triton kernels on CUDA.
+    softmax   causal softmax attention with RoPE (strong baseline)
+    linear    linear attention, phi = elu + 1 (Katharopoulos et al., 2020) (simple baseline)
 """
 
 from __future__ import annotations
 
 import functools
-import math
-import warnings
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -150,62 +140,10 @@ class LinearAttention(nn.Module):
         return self.o_proj(o.transpose(1, 2).reshape(B, T, D))
 
 
-# ---------------------------------------------------------------- delta rule
-
-@_full_precision
-def delta_rule_recurrent(q, k, v, g, beta, scale: Optional[float] = None):
-    """Reference gated delta rule, step by step, in float32.
-
-    Shapes: q, k (B, T, H, K); v (B, T, H, V); beta (B, T, H);
-    g is the log-decay, (B, T, H) for Gated DeltaNet or (B, T, H, K) for KDA.
-
-        S_t = Diag(exp(g_t)) S_{t-1}                       (decay; scalar for GDN)
-        S_t = S_t + beta_t k_t (v_t - S_t^T k_t)^T         (delta-rule write)
-        o_t = S_t^T (scale * q_t)
-
-    Equivalent to S_t = S_{t-1} a_t (I - b_t k_t k_t^T) + b_t v_t k_t^T in the
-    papers' notation (state transposed). Matches fla's convention.
-    """
-    dtype = v.dtype
-    q, k, v, g, beta = (_up(t) for t in (q, k, v, g, beta))
-    B, T, H, K = q.shape
-    scale = K ** -0.5 if scale is None else scale
-    if g.dim() == 3:
-        g = g.unsqueeze(-1)                       # broadcast over key channels
-    decay = g.exp().unsqueeze(-1)                 # (B, T, H, K|1, 1)
-    S = q.new_zeros(B, H, K, v.shape[-1])
-    out = []
-    for t in range(T):
-        S = S * decay[:, t]
-        kt = k[:, t]
-        v_old = torch.einsum("bhk,bhkv->bhv", kt, S)
-        u = (v[:, t] - v_old) * beta[:, t, :, None]
-        S = S + kt.unsqueeze(-1) * u.unsqueeze(-2)
-        out.append(torch.einsum("bhk,bhkv->bhv", q[:, t] * scale, S))
-    return torch.stack(out, dim=1).to(dtype)
-
-
-def _fla_kernel(per_channel: bool):
-    try:
-        if per_channel:
-            from fla.ops.kda import chunk_kda as fn
-        else:
-            from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fn
-        return fn
-    except Exception:  # ImportError, or Triton problems at import time
-        return None
-
-
-def delta_rule_fla(q, k, v, g, beta, scale, per_channel: bool):
-    fn = _fla_kernel(per_channel)
-    if fn is None:
-        raise RuntimeError("flash-linear-attention is not installed; `pip install flash-linear-attention`")
-    out = fn(q=q, k=k, v=v, g=g, beta=beta, scale=scale, output_final_state=False)
-    return out[0] if isinstance(out, tuple) else out
-
+# ---------------------------------------------------------------- short conv
 
 class ShortConv(nn.Module):
-    """Causal depthwise conv over time, as used by GDN / KDA before q, k, v."""
+    """Causal depthwise conv over time (the optional shared --short-conv)."""
 
     def __init__(self, dim: int, kernel: int):
         super().__init__()
@@ -216,98 +154,9 @@ class ShortConv(nn.Module):
         return self.conv(x.transpose(1, 2))[..., :T].transpose(1, 2)
 
 
-class DeltaRuleAttention(nn.Module):
-    """Gated DeltaNet (per_channel=False) or Kimi Delta Attention (per_channel=True)."""
-
-    def __init__(self, cfg, per_channel: bool):
-        super().__init__()
-        D, H = cfg.d_model, cfg.n_heads
-        self.h, self.dk = H, D // H
-        self.dv = int(self.dk * cfg.expand_v)
-        self.per_channel = per_channel
-        self.kernel = cfg.kernel
-        key_dim, val_dim = H * self.dk, H * self.dv
-
-        self.q_proj = nn.Linear(D, key_dim, bias=False)
-        self.k_proj = nn.Linear(D, key_dim, bias=False)
-        self.v_proj = nn.Linear(D, val_dim, bias=False)
-        self.q_conv = ShortConv(key_dim, cfg.conv_size)
-        self.k_conv = ShortConv(key_dim, cfg.conv_size)
-        self.v_conv = ShortConv(val_dim, cfg.conv_size)
-        self.b_proj = nn.Linear(D, H, bias=False)
-
-        n_decay = key_dim if per_channel else H
-        if per_channel:   # KDA: low-rank projection to one decay per key channel
-            self.a_proj = nn.Sequential(nn.Linear(D, self.dk, bias=False),
-                                        nn.Linear(self.dk, key_dim, bias=False))
-            self.g_proj = nn.Sequential(nn.Linear(D, self.dv, bias=False),
-                                        nn.Linear(self.dv, val_dim, bias=False))
-        else:             # GDN: one decay per head, full-rank output gate
-            self.a_proj = nn.Linear(D, H, bias=False)
-            self.g_proj = nn.Linear(D, val_dim, bias=False)
-        # Mamba-style decay parameterization: g = -exp(A_log) * softplus(a + dt_bias)
-        self.A_log = nn.Parameter(torch.log(torch.empty(H).uniform_(1, 16)))
-        dt = torch.exp(torch.empty(n_decay).uniform_(math.log(1e-3), math.log(1e-1))).clamp(min=1e-4)
-        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))   # inverse softplus
-        self.A_log._no_weight_decay = True
-        self.dt_bias._no_weight_decay = True
-
-        self.o_norm = RMSNorm(self.dv, cfg.norm_eps)
-        self.o_proj = nn.Linear(val_dim, D, bias=False)
-
-    def use_fla(self, x) -> bool:
-        if self.kernel == "torch":
-            return False
-        if self.kernel == "fla":
-            return True
-        ok = x.is_cuda and _fla_kernel(self.per_channel) is not None
-        if x.is_cuda and not ok and not getattr(self, "_warned", False):
-            warnings.warn("fla not available: falling back to the slow PyTorch delta rule on GPU")
-            self._warned = True
-        return ok
-
-    def forward(self, x):
-        B, T, _ = x.shape
-        H, K, V = self.h, self.dk, self.dv
-        q = F.silu(self.q_conv(self.q_proj(x))).view(B, T, H, K)
-        k = F.silu(self.k_conv(self.k_proj(x))).view(B, T, H, K)
-        v = F.silu(self.v_conv(self.v_proj(x))).view(B, T, H, V)
-        q, k = F.normalize(_up(q), dim=-1).to(v.dtype), F.normalize(_up(k), dim=-1).to(v.dtype)
-        beta = torch.sigmoid(_up(self.b_proj(x)))                     # (B, T, H)
-
-        a = _up(self.a_proj(x))
-        A = _up(self.A_log).exp()
-        if self.per_channel:
-            g = -A.view(H, 1) * F.softplus(a.view(B, T, H, K) + _up(self.dt_bias).view(H, K))
-        else:
-            g = -A * F.softplus(a + _up(self.dt_bias))                 # (B, T, H)
-
-        if self.use_fla(x):
-            o = delta_rule_fla(q, k, v, g, beta.to(v.dtype), K ** -0.5, self.per_channel)
-        else:
-            o = delta_rule_recurrent(q, k, v, g, beta, K ** -0.5)
-
-        gate = self.g_proj(x).view(B, T, H, V)
-        gate = torch.sigmoid(gate) if self.per_channel else F.silu(gate)
-        o = self.o_norm(o.to(x.dtype)) * gate
-        return self.o_proj(o.reshape(B, T, H * V))
-
-
-class GatedDeltaNet(DeltaRuleAttention):
-    def __init__(self, cfg):
-        super().__init__(cfg, per_channel=False)
-
-
-class KimiDeltaAttention(DeltaRuleAttention):
-    def __init__(self, cfg):
-        super().__init__(cfg, per_channel=True)
-
-
 ATTENTION = {
     "softmax": SoftmaxAttention,
     "linear": LinearAttention,
-    "gated_deltanet": GatedDeltaNet,
-    "kda": KimiDeltaAttention,
 }
 
 

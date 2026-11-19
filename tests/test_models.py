@@ -1,11 +1,10 @@
 """Checks for the attention layers, backbone, data pipeline and decoding.
 
-Runs on CPU. Tests that compare against the fla Triton kernels run only when
-CUDA and flash-linear-attention are available (run them once on the GPU box).
-Skipped entirely when PyTorch is not installed.
+Runs on CPU. Skipped entirely when PyTorch is not installed.
 """
 
 import json
+import random
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,38 +19,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 if HAVE_TORCH:
     import torch.nn.functional as F
-    from models.attention import (ATTENTION, build_attention, delta_rule_recurrent, _fla_kernel,
-                                  linear_attention_chunked, linear_attention_recurrent)
-    from models.data import (IGNORE_INDEX, BucketBatchSampler, Vocab, collate, encode_record,
-                             eval_batches, load_split)
+    from models.attention import (ATTENTION, build_attention, linear_attention_chunked,
+                                  linear_attention_recurrent)
+    from models.data import (EXTRA_QUERY_LEN, IGNORE_INDEX, BucketBatchSampler, Vocab, collate,
+                             encode_record, eval_batches, load_split)
     from models.inference import greedy_decode, load_checkpoint, save_checkpoint
     from models.model import LanguageModel, ModelConfig
 
     def tiny_cfg(attention, **kw):
         base = dict(vocab_size=50, attention=attention, d_model=32, n_layers=2, n_heads=2,
-                    kernel="torch", linear_chunk=8)
+                    linear_chunk=8)
         base.update(kw)
         return ModelConfig(**base)
-
-HAVE_FLA_GPU = HAVE_TORCH and torch.cuda.is_available() and _fla_kernel(False) is not None
-
-
-def recurrent_ref_loop(q, k, v, g, beta, scale):
-    """Independent, unbatched float64 gated delta rule, one (example, head) at a time:
-    S <- Diag(a) S;  S <- S - b k (k^T S) + b k v^T;  o = S^T (scale q)."""
-    B, T, H, K = q.shape
-    out = torch.zeros(B, T, H, v.shape[-1], dtype=torch.float64)
-    for b in range(B):
-        for h in range(H):
-            S = torch.zeros(K, v.shape[-1], dtype=torch.float64)
-            for t in range(T):
-                a = g[b, t, h].double().exp()
-                S = (a[:, None] if a.dim() else a) * S
-                kt = k[b, t, h].double()
-                S = S - beta[b, t, h].double() * torch.outer(kt, kt @ S) \
-                      + beta[b, t, h].double() * torch.outer(kt, v[b, t, h].double())
-                out[b, t, h] = S.T @ (q[b, t, h].double() * scale)
-    return out
 
 
 @unittest.skipUnless(HAVE_TORCH, "PyTorch not installed")
@@ -97,71 +76,6 @@ class AttentionLayerTest(unittest.TestCase):
                 got = linear_attention_chunked(q, k, v, chunk=chunk).double()
                 torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-6)
 
-    def test_delta_rule_matches_unbatched_loop(self):
-        B, T, H, K, V = 2, 7, 2, 4, 3
-        q, k = (F.normalize(torch.randn(B, T, H, K, dtype=torch.float64), dim=-1) for _ in range(2))
-        v = torch.randn(B, T, H, V, dtype=torch.float64)
-        beta = torch.rand(B, T, H, dtype=torch.float64)
-        for g in (-torch.rand(B, T, H, dtype=torch.float64),          # GDN: scalar per head
-                  -torch.rand(B, T, H, K, dtype=torch.float64)):      # KDA: per channel
-            with self.subTest(g_dim=g.dim()):
-                got = delta_rule_recurrent(q, k, v, g, beta, scale=0.5).double()
-                torch.testing.assert_close(got, recurrent_ref_loop(q, k, v, g, beta, 0.5))
-
-    def test_delta_rule_overwrites_value_under_same_key(self):
-        """The property that should help on Update examples: with beta = 1 and
-        no decay, writing key k twice replaces the first value, while plain
-        linear attention returns a mix of both."""
-        K = 4
-        k = F.normalize(torch.randn(K, dtype=torch.float64), dim=0)
-        keys = k.expand(1, 2, 1, K).clone()
-        vals = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float64).view(1, 2, 1, 2)
-        o = delta_rule_recurrent(keys, keys, vals, torch.zeros(1, 2, 1, dtype=torch.float64),
-                                 torch.ones(1, 2, 1, dtype=torch.float64), scale=1.0)
-        torch.testing.assert_close(o[0, -1, 0], torch.tensor([0.0, 1.0], dtype=torch.float64))
-        lin = linear_attention_recurrent(keys.transpose(1, 2) + 1, keys.transpose(1, 2) + 1,
-                                         vals.transpose(1, 2))
-        torch.testing.assert_close(lin[0, 0, -1], torch.tensor([0.5, 0.5], dtype=torch.float64))
-
-    def test_decay_forgets(self):
-        """A strongly negative log-decay should erase earlier memory."""
-        K = 4
-        k = F.normalize(torch.randn(1, 2, 1, K, dtype=torch.float64), dim=-1)
-        v = torch.randn(1, 2, 1, 3, dtype=torch.float64)
-        g = torch.tensor([0.0, -50.0], dtype=torch.float64).view(1, 2, 1)
-        beta = torch.tensor([1.0, 0.0], dtype=torch.float64).view(1, 2, 1)
-        o = delta_rule_recurrent(k, k, v, g, beta, 1.0)
-        self.assertLess(o[0, 1].abs().max().item(), 1e-12)
-
-    @unittest.skipUnless(HAVE_FLA_GPU, "needs CUDA + flash-linear-attention")
-    def test_fla_kernels_match_reference(self):
-        from models.attention import delta_rule_fla
-        torch.manual_seed(0)
-        B, T, H, K = 2, 300, 4, 64
-        dev = "cuda"
-        q, k = (F.normalize(torch.randn(B, T, H, K, device=dev), dim=-1) for _ in range(2))
-        v = torch.randn(B, T, H, K, device=dev)
-        beta = torch.rand(B, T, H, device=dev)
-        for per_channel in (False, True):
-            with self.subTest(per_channel=per_channel):
-                shape = (B, T, H, K) if per_channel else (B, T, H)
-                g = F.logsigmoid(torch.randn(*shape, device=dev) + 3)
-                ref = delta_rule_recurrent(q, k, v, g, beta, K ** -0.5)
-                got = delta_rule_fla(q, k, v, g, beta, K ** -0.5, per_channel).float()
-                torch.testing.assert_close(got, ref, rtol=2e-2, atol=2e-3)
-
-    @unittest.skipUnless(HAVE_FLA_GPU, "needs CUDA + flash-linear-attention")
-    def test_fla_layer_matches_torch_layer(self):
-        for name in ("gated_deltanet", "kda"):
-            with self.subTest(name):
-                torch.manual_seed(0)
-                layer = build_attention(tiny_cfg(name, d_model=128, n_heads=2)).cuda()
-                x = torch.randn(2, 200, 128, device="cuda")
-                layer.kernel = "torch"
-                ref = layer(x)
-                layer.kernel = "fla"
-                torch.testing.assert_close(layer(x), ref, rtol=2e-2, atol=2e-3)
-
 
 @unittest.skipUnless(HAVE_TORCH, "PyTorch not installed")
 class BackboneTest(unittest.TestCase):
@@ -181,9 +95,14 @@ class BackboneTest(unittest.TestCase):
                 padded = torch.cat([ids, torch.zeros(1, 6, dtype=torch.long)], dim=1)
                 torch.testing.assert_close(m(ids), m(padded)[:, :13])
 
+    def test_config_ignores_removed_settings(self):
+        """Checkpoints saved before gated_deltanet/kda were removed still load."""
+        old = dict(tiny_cfg("softmax").to_dict(), conv_size=4, expand_v=1.0, kernel="auto")
+        self.assertEqual(ModelConfig.from_dict(old), tiny_cfg("softmax"))
+
     def test_checkpoint_roundtrip(self):
         vocab = Vocab(["<pad>", "<bos>", "<sep>", "<eos>"] + [f"w{i}" for i in range(46)])
-        m = LanguageModel(tiny_cfg("kda"))
+        m = LanguageModel(tiny_cfg("linear"))
         with tempfile.TemporaryDirectory() as d:
             save_checkpoint(Path(d) / "c.pt", m, vocab, step=3)
             m2, v2, ck = load_checkpoint(Path(d) / "c.pt", torch.device("cpu"))
@@ -211,6 +130,11 @@ class DataPipelineTest(unittest.TestCase):
             {"id": "x-3", "task": "update", "context_length": 128,
              "context": "Project Shark status: jasmine. Project Shark is velvet.",
              "query": "What is the current status of Project Shark?", "answer": "velvet"},
+            {"id": "x-4", "task": "update", "context_length": 128,
+             "context": "Project Trout status: oasis. Project Heron is red. The team lunch ran late "
+                        "on Friday. Project Falcon is pending. Project Trout is merged. "
+                        "The status of Project Heron is blue.",
+             "query": "What is the current status of Project Trout?", "answer": "merged"},
         ]
         (d / "dev.jsonl").write_text("".join(json.dumps(r) + "\n" for r in recs))
         cls.dir, cls.recs = d, recs
@@ -227,41 +151,85 @@ class DataPipelineTest(unittest.TestCase):
 
     def test_encode_format(self):
         v = self.vocab
-        seq, plen = encode_record(self.recs[0], v)
+        seq, plen, _ = encode_record(self.recs[0], v)
         self.assertEqual(seq[0], v.bos_id)
         self.assertEqual(seq[plen - 1], v.sep_id)
         self.assertEqual([v.itos[i] for i in seq[plen:]], ["oasis", "<eos>"])
         self.assertEqual(sum(1 for i in seq if i == v.sep_id), 2)
         self.assertEqual(v.decode(seq[plen:]), "oasis")
 
+    def test_encode_extra_pairs_are_other_projects_current_values(self):
+        v = self.vocab
+        _, _, extra = encode_record(self.recs[3], v)
+        self.assertEqual([(v.itos[e], v.itos[val]) for e, val in extra],
+                         [("Heron", "blue"), ("Falcon", "pending")])
+        self.assertEqual(encode_record(self.recs[0], v)[2], [])
+        bad = dict(self.recs[3], answer="oasis")      # stale value given as answer
+        with self.assertRaises(ValueError):
+            encode_record(bad, v)
+
     def test_load_split_and_cache(self):
         a = load_split(self.dir, "dev", self.vocab)
         b = load_split(self.dir, "dev", self.vocab)      # from cache
         self.assertEqual(a.ids, b.ids)
         self.assertTrue((a.tokens == b.tokens).all())
+        self.assertTrue((a.extra == b.extra).all())
         short = load_split(self.dir, "dev", self.vocab, max_context_length=128)
-        self.assertEqual(short.ids, ["x-1", "x-3"])
+        self.assertEqual(short.ids, ["x-1", "x-3", "x-4"])
+        self.assertEqual(short.num_extra(2), 2)          # extra pairs survive subsetting
         self.assertEqual(len(load_split(self.dir, "dev", self.vocab, max_examples=2, seed=1)), 2)
 
     def test_collate_supervises_only_answer_and_eos(self):
         split = load_split(self.dir, "dev", self.vocab)
-        x, y = collate(split, [0, 1], self.vocab.pad_id)
-        for row in range(2):
-            p, n = int(split.prompt_lens[row]), split.seq_len(row)
+        x, y, official = collate(split, [0, 1, 3], self.vocab)
+        for row, i in enumerate([0, 1, 3]):
+            p, n = int(split.prompt_lens[i]), split.seq_len(i)
             labels = y[row][y[row] != IGNORE_INDEX].tolist()
-            self.assertEqual(labels, split.seq(row)[p:].tolist())
+            self.assertEqual(labels, split.seq(i)[p:].tolist())
             self.assertEqual(x[row, p - 1].item(), self.vocab.sep_id)   # predicts the answer
             self.assertTrue((x[row, n - 1:] == self.vocab.pad_id).all())
+            self.assertEqual(official[row].nonzero().flatten().tolist(), [p - 1])
+
+    def test_collate_multi_query(self):
+        v = self.vocab
+        split = load_split(self.dir, "dev", v)
+        x, y, official = collate(split, [3], v, max_extra=-1, rng=random.Random(0))
+        p = int(split.prompt_lens[3])
+        # prompt is untouched, so evaluation (which decodes after the prompt) is unchanged
+        self.assertEqual(x[0, :p].tolist(), split.seq(3)[:p].tolist())
+        self.assertEqual(official[0].nonzero().flatten().tolist(), [p - 1])
+        self.assertEqual(y[0, p - 1].item(), v.stoi["merged"])
+        # labels: official answer, then each other project's current value, then <eos>
+        labels = [v.itos[t] for t in y[0][y[0] != IGNORE_INDEX].tolist()]
+        self.assertEqual(labels[0], "merged")
+        self.assertEqual(sorted(labels[1:-1]), ["blue", "pending"])
+        self.assertEqual(labels[-1], "<eos>")
+        # each extra value is predicted right after "<sep> What is ... Project E ? <sep>"
+        text = [v.itos[t] for t in x[0].tolist()]
+        for pos in (y[0] != IGNORE_INDEX).nonzero().flatten().tolist()[1:-1]:
+            self.assertEqual(text[pos], "<sep>")
+            entity = text[pos - 2]
+            q_len = EXTRA_QUERY_LEN - 3
+            self.assertEqual(text[pos - q_len:pos], [v.itos[t] for t in v.query_ids(v.stoi[entity])])
+            self.assertEqual(text[pos - q_len - 1], "<sep>")
+            self.assertEqual({"Heron": "blue", "Falcon": "pending"}[entity], v.itos[y[0, pos].item()])
+        self.assertEqual(len(split.seq(3)) + 2 * EXTRA_QUERY_LEN, x.shape[1] + 1)
+        # a cap of 1 adds exactly one extra query
+        x1, y1, _ = collate(split, [3], v, max_extra=1, rng=random.Random(0))
+        self.assertEqual((y1 != IGNORE_INDEX).sum().item(), 3)
+        self.assertEqual(split.train_len(3, 1), x1.shape[1] + 1)
 
     def test_samplers(self):
         split = load_split(self.dir, "dev", self.vocab)
         s = BucketBatchSampler(split, max_tokens=10_000, seed=0, curriculum_steps=10)
+        s_mq = BucketBatchSampler(split, max_tokens=10_000, seed=0, max_extra=-1)
+        self.assertLess(s_mq.batch_sizes[0], s.batch_sizes[0])   # room for the extra queries
         self.assertEqual(s.allowed(0), 1)
         self.assertEqual(s.allowed(10), 2)
         for step in range(5):     # curriculum: only the 128 bucket at the start
             self.assertTrue(all(split.buckets[i] == 128 for i in s.batch(step)))
         covered = sorted(i for b in eval_batches(split, 40) for i in b)
-        self.assertEqual(covered, [0, 1, 2])
+        self.assertEqual(covered, [0, 1, 2, 3])
 
     def test_greedy_decode_returns_tokens(self):
         split = load_split(self.dir, "dev", self.vocab)
@@ -276,7 +244,7 @@ class DataPipelineTest(unittest.TestCase):
         split = load_split(self.dir, "dev", self.vocab)
         m = LanguageModel(tiny_cfg("softmax", vocab_size=len(self.vocab)))
         opt = torch.optim.AdamW(m.parameters(), lr=3e-3)
-        x, y = collate(split, [0, 1, 2], self.vocab.pad_id)
+        x, y, _ = collate(split, [0, 1, 2], self.vocab)
         for _ in range(150):
             sel = y != IGNORE_INDEX
             loss = F.cross_entropy(m.head(m.hidden(x)[sel]), y[sel])

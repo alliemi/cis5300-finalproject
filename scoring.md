@@ -54,14 +54,14 @@ scores are not directly comparable across these datasets and protocols.
 ## Inputs and command line
 
 Run from the repository root using Python 3. No packages need to be installed.
-The gold input is an extracted dataset split, in the JSONL format in `data.md`.
+The gold input is a dataset split, in the JSONL format in `data.md`.
 The scoring fields required on each gold record are `id`, `answer`, `task`,
 `stale_values`, `distractor_values`, `context_length`, `num_entities`, `num_updates`,
 and `needle_position_bin`; `context` and `query` are ignored by the evaluator.
-To extract only the development split from the supplied archive:
+To generate the splits (including `data/dev.jsonl`):
 
 ```sh
-tar -xzf data.tar.gz data/dev.jsonl
+python3 generate_data.py --out data
 ```
 
 Each line of the system output must be a JSON object with a unique `id` and a
@@ -160,8 +160,8 @@ only, not query or separator tokens.
 
 Use the development split for model selection and debugging. Reserve the test
 split for final evaluation, as specified in `data.md`. Use the same prediction
-format and scoring policy for all architectures. No trained baseline scores are
-included here because this deliverable implements only evaluation.
+format and scoring policy for all architectures. Baseline scores are reported in
+`simple-baseline.md` (linear attention) and `strong-baseline.md` (softmax attention).
 
 ## Verification
 

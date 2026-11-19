@@ -7,7 +7,7 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -28,7 +28,9 @@ def pick_device(name: str = "auto") -> torch.device:
 
 
 def autocast(device: torch.device, enabled: bool = True):
-    if enabled and device.type == "cuda" and torch.cuda.is_bf16_supported():
+    # Native bf16 only (Ampere+, e.g. A100/L4). On older GPUs such as the T4,
+    # is_bf16_supported() can report emulated bf16, which is slow: use fp32 there.
+    if enabled and device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 8:
         return torch.autocast("cuda", dtype=torch.bfloat16)
     return contextlib.nullcontext()
 
@@ -131,12 +133,9 @@ def write_predictions(path, split: EncodedSplit, preds: Dict[str, str]) -> None:
             f.write(json.dumps({"id": ex_id, "prediction": preds[ex_id]}) + "\n")
 
 
-def load_checkpoint(path, device: torch.device, kernel: Optional[str] = None):
+def load_checkpoint(path, device: torch.device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    cfg_dict = dict(ckpt["config"])
-    if kernel is not None:
-        cfg_dict["kernel"] = kernel
-    model = LanguageModel(ModelConfig(**cfg_dict)).to(device)
+    model = LanguageModel(ModelConfig.from_dict(ckpt["config"])).to(device)
     state = ckpt["model"]
     state = {k.removeprefix("_orig_mod.") if hasattr(k, "removeprefix") else k: v for k, v in state.items()}
     model.load_state_dict(state)
